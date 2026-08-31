@@ -1,0 +1,6 @@
+interface:
+  display_name: "Codex 会话标题维护"
+  short_description: "按进度、PR 状态、状态 emoji 与时间戳安全维护会话标题"
+  default_prompt: "Use $codex-session-title-maintenance to safely update my recent Codex session titles."
+policy:
+  allow_implicit_invocation: true
