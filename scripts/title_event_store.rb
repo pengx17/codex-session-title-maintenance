@@ -33,18 +33,8 @@ module TitleEventMaintenance
     File.delete(temp) if defined?(temp) && temp && File.exist?(temp)
   end
 
-  class BusinessHours
+  class BeijingCalendar
     UTC_OFFSET = "+08:00"
-    START_MINUTE = 9 * 60
-    END_MINUTE = 18 * 60
-
-    def self.open?(time = Time.now)
-      local = time.getlocal(UTC_OFFSET)
-      return false unless (1..5).include?(local.wday)
-
-      minute = local.hour * 60 + local.min
-      minute >= START_MINUTE && minute <= END_MINUTE
-    end
 
     def self.date(time = Time.now)
       time.getlocal(UTC_OFFSET).strftime("%Y-%m-%d")

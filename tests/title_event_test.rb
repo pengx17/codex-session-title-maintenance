@@ -57,11 +57,10 @@ class TitleEventStoreTest < Minitest::Test
     assert_equal 1, @store.queue_size
   end
 
-  def test_business_hours_are_beijing_weekdays_only
-    assert TitleEventMaintenance::BusinessHours.open?(Time.new(2026, 8, 21, 9, 0, 0, "+08:00"))
-    assert TitleEventMaintenance::BusinessHours.open?(Time.new(2026, 8, 21, 18, 0, 0, "+08:00"))
-    refute TitleEventMaintenance::BusinessHours.open?(Time.new(2026, 8, 21, 18, 1, 0, "+08:00"))
-    refute TitleEventMaintenance::BusinessHours.open?(Time.new(2026, 8, 22, 10, 0, 0, "+08:00"))
+  def test_reconciliation_date_uses_beijing_calendar_day
+    assert_equal "2026-08-22", TitleEventMaintenance::BeijingCalendar.date(
+      Time.new(2026, 8, 21, 16, 0, 0, "+00:00")
+    )
   end
 end
 
@@ -135,10 +134,23 @@ class TitleEventInstallerTest < Minitest::Test
     assert_equal %(hooks.state."#{key}".trusted_hash), TitleEventInstaller.trust_key_path(key)
   end
 
-  def test_beijing_nine_maps_to_tokyo_ten
-    tokyo = Time.new(2026, 8, 24, 12, 0, 0, "+09:00")
-    assert_equal({ "Hour" => 10, "Minute" => 0, "Weekday" => 1 }, TitleEventInstaller.local_start(tokyo))
+  def test_launch_agent_is_run_at_load_without_a_calendar_gate
+    installer = TitleEventInstaller.allocate
+    installer.instance_variable_set(:@app_server_bin, "/app-server")
+    installer.instance_variable_set(:@decision_codex, "/codex")
+    installer.instance_variable_set(:@gh_bin, "/gh")
+    installer.instance_variable_set(:@codex_home, "/tmp/codex")
+    installer.instance_variable_set(:@runtime_root, "/tmp/runtime")
+    installer.instance_variable_set(:@worker_script, "/tmp/worker.rb")
+    installer.instance_variable_set(:@label, "local.test")
+    installer.instance_variable_set(:@home, "/tmp/home")
+
+    plist = installer.send(:launch_agent_plist)
+
+    assert_includes plist, "<key>RunAtLoad</key>"
+    refute_includes plist, "StartCalendarInterval"
   end
+
 end
 
 class CodexAppServerClientTest < Minitest::Test
@@ -300,6 +312,21 @@ class TitleEventWorkerReconciliationTest < Minitest::Test
     assert_equal [thread_id], helper.options[:thread_ids]
     assert_equal [thread_id], helper.options[:force_thread_ids]
   end
+
+  def test_explicit_stop_event_runs_outside_the_former_business_hours
+    thread_id = "33333333-3333-7333-8333-333333333333"
+    helper = FakeHelper.new
+    worker = TitleEventWorker.new(
+      store: EventStore.new(thread_id),
+      helper: helper,
+      now: -> { Time.new(2026, 8, 24, 2, 0, 0, "+08:00") }
+    )
+
+    result = worker.run(dry_run: true)
+
+    refute result["reconcile"]
+    assert_equal [thread_id], helper.options[:thread_ids]
+  end
 end
 
 class TitleEventWorkerConcurrencyTest < Minitest::Test
@@ -383,5 +410,40 @@ class TitleEventWorkerConcurrencyTest < Minitest::Test
     assert_empty client.set_calls
     assert_empty helper.records
     assert_equal "changed-during-decision", store.deferred.first["source"]
+  end
+
+  def test_attach_live_versions_collects_named_threads_without_filter_map
+    store = RecordingStore.new
+    client = ChangingClient.new(
+      "name" => "Codex 原生标题",
+      "updatedAt" => 100,
+      "status" => { "type" => "idle" }
+    )
+    worker = TitleEventWorker.new(store: store, app_client_factory: -> { client })
+
+    candidates = worker.send(:attach_live_versions, [{ "id" => THREAD_ID }], 2_000)
+
+    assert_equal ["Codex 原生标题"], candidates.map { |candidate| candidate["title"] }
+  end
+
+  def test_daemon_wait_can_be_woken_without_waiting_for_the_timeout
+    worker = TitleEventWorker.allocate
+    reader, writer = IO.pipe
+    worker.instance_variable_set(:@wake_reader, reader)
+    worker.instance_variable_set(:@wake_writer, writer)
+    notifier = Thread.new do
+      sleep 0.02
+      writer.write(".")
+    end
+
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    worker.send(:wait_for_wake, 1)
+    elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+
+    assert_operator elapsed, :<, 0.5
+  ensure
+    notifier&.join
+    reader&.close unless reader&.closed?
+    writer&.close unless writer&.closed?
   end
 end

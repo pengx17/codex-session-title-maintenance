@@ -37,9 +37,8 @@ class TitleEventWorker
 
   def run(allow_outside_hours: false, force_reconcile: false, dry_run: false)
     current_time = @now.call
-    unless allow_outside_hours || TitleEventMaintenance::BusinessHours.open?(current_time)
-      return { "status" => "skipped", "reason" => "outside_beijing_business_hours" }
-    end
+    # Kept as a no-op keyword for compatibility with older recovery commands.
+    _allow_outside_hours = allow_outside_hours
 
     result = nil
     locked = @store.with_worker_lock do
@@ -53,11 +52,18 @@ class TitleEventWorker
   def run_daemon
     result = nil
     locked = @store.with_worker_lock do
-      previous_handler = Signal.trap("USR1") { @wake_requested = true }
+      @wake_reader, @wake_writer = IO.pipe
+      previous_handler = Signal.trap("USR1") do
+        @wake_writer.write_nonblock(".", exception: false)
+      rescue IOError, SystemCallError
+        nil
+      end
       begin
         result = daemon_loop
       ensure
         Signal.trap("USR1", previous_handler)
+        @wake_reader.close unless @wake_reader.closed?
+        @wake_writer.close unless @wake_writer.closed?
       end
     end
     return { "status" => "skipped", "reason" => "worker_already_running" } unless locked
@@ -81,7 +87,7 @@ class TitleEventWorker
       poll_tracked_prs(now_ms)
     end
 
-    date = TitleEventMaintenance::BusinessHours.date(current_time)
+    date = TitleEventMaintenance::BeijingCalendar.date(current_time)
     event_state = @store.read_state
     reconcile = force_reconcile || event_state["last_reconcile_date"] != date
     snapshot = @store.snapshot(now_ms: now_ms, idle_ms: IDLE_MS)
@@ -161,19 +167,24 @@ class TitleEventWorker
   end
 
   def daemon_loop
-    last_result = { "status" => "finished", "reason" => "business_hours_closed" }
+    last_result = { "status" => "finished", "reason" => "daemon_started" }
     loop do
       current_time = @now.call
-      break unless TitleEventMaintenance::BusinessHours.open?(current_time)
-
-      @wake_requested = false
       last_result = run_locked(current_time, force_reconcile: false, dry_run: false)
       sleep_seconds = next_wake_seconds(@now.call)
-      break if sleep_seconds <= 0
-
-      sleep(sleep_seconds)
+      wait_for_wake(sleep_seconds)
     end
     last_result
+  end
+
+  def wait_for_wake(seconds)
+    return sleep(seconds) unless @wake_reader
+    return unless IO.select([@wake_reader], nil, nil, seconds)
+
+    loop do
+      chunk = @wake_reader.read_nonblock(4_096, exception: false)
+      break if chunk == :wait_readable || chunk.nil?
+    end
   end
 
   def next_wake_seconds(current_time)
@@ -186,14 +197,7 @@ class TitleEventWorker
     queue_wait = @store.seconds_until_next(now_ms: now_ms, idle_ms: IDLE_MS)
     waits << queue_wait if queue_wait
     waits << [((integer(state["last_pr_poll_ms"]) + PR_POLL_MS - now_ms) / 1000.0), 1].max
-    waits << seconds_until_business_close(current_time)
     [waits.min || 60, 1].max
-  end
-
-  def seconds_until_business_close(current_time)
-    local = current_time.getlocal(TitleEventMaintenance::BusinessHours::UTC_OFFSET)
-    close_time = Time.new(local.year, local.month, local.day, 18, 1, 0, TitleEventMaintenance::BusinessHours::UTC_OFFSET)
-    [close_time - local, 0].max
   end
 
   def ensure_retryable_snapshot(snapshot, candidates, now_ms)
@@ -232,7 +236,7 @@ class TitleEventWorker
 
     client = @app_client_factory.call
     client.connect
-    candidates.filter_map do |candidate|
+    candidates.each_with_object([]) do |candidate, result|
       live = client.read_thread(candidate["id"])
       live_title = live["name"].to_s.strip
       if live_title.empty?
@@ -240,7 +244,7 @@ class TitleEventWorker
         next
       end
 
-      candidate.merge(
+      result << candidate.merge(
         "title" => live_title,
         "live_version" => live_thread_version(live)
       )

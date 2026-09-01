@@ -16,11 +16,11 @@ Codex Stop hook -> durable queue -> launchd worker -> verified Codex title write
 ```
 
 - `title_event_hook.rb` queues the stopped thread and wakes the worker without blocking or failing the Codex session.
-- Codex owns the initial task title. `title_event_worker.rb --daemon` is a delayed second pass: it runs only on Beijing weekdays from 09:00 through 18:00, waits for five minutes of thread inactivity, and batches semantic decisions.
+- Codex owns the initial task title. `title_event_worker.rb --daemon` is an always-on delayed second pass: it waits for five minutes of thread inactivity and batches semantic decisions. Stop events are processed regardless of weekday or clock time.
 - Explicit Stop/PR events bypass the stale `session_index.jsonl` timestamp filter after the inactivity wait. Before deciding, read the live Codex title/version; immediately before writing, read it again. If the native title, manual title, task status, or task version changed, discard the old decision and requeue after another inactivity window.
 - Poll only already-tracked open PR metadata every ten minutes. PR status-class changes are deterministic and do not invoke a model. Use `gpt-5.6-terra` at `high` only for semantic title decisions.
 - Keep executables separate: use the configured CLI for Terra decisions, and the Desktop-bundled Codex binary for the short-lived writable app-server. Do not substitute an older standalone stdio app-server.
-- Reconcile recent and pinned threads once per Beijing workday as a loss-recovery path; this is not an hourly model scan.
+- Reconcile recent and pinned threads once per Beijing calendar day as a loss-recovery path; this is not an hourly model scan.
 - A transient failure waits ten minutes. Notify through macOS only after the second consecutive failure; never create a Codex inbox item.
 
 Core scripts:
@@ -42,7 +42,7 @@ INSTALLER="${CODEX_HOME:-$HOME/.codex}/skills/codex-session-title-maintenance/sc
 /usr/bin/ruby --disable=gems "$INSTALLER" doctor
 ```
 
-The installer is idempotent. It derives the current home and Codex directories, finds Apple Silicon or Intel Homebrew executables, maps Beijing 09:00 to the Mac's local clock, preserves unrelated hooks, writes trust through Codex `config/batchWrite`, and safely reloads launchd. A successful install requires one enabled Stop hook with `trust_status=trusted`, a loaded valid LaunchAgent, a paused-or-absent legacy heartbeat, and a real Stop canary that verifies thread-id extraction and an isolated durable-queue write.
+The installer is idempotent. It derives the current home and Codex directories, finds Apple Silicon or Intel Homebrew executables, preserves unrelated hooks, writes trust through Codex `config/batchWrite`, and safely reloads an always-on launchd worker. A successful install requires one enabled Stop hook with `trust_status=trusted`, a loaded valid LaunchAgent, a paused-or-absent legacy heartbeat, and a real Stop canary that verifies thread-id extraction and an isolated durable-queue write.
 
 To migrate, first verify the target's identity; never infer it from the nearest SSH alias. For a LAN Mac, resolve its Bonjour SSH service and confirm hostname, user, architecture, GUI launchd domain, and Codex home before copying anything. Then copy this entire skill directory into the target Mac's `$CODEX_HOME/skills/` and run the same `install --canary` command from that Mac's logged-in GUI user. Preflight Codex/app-server, `gh`, filesystem paths, network reachability, and existing host authentication before requesting any new login. Never copy source-machine absolute paths or trusted hashes; the target installer regenerates both.
 
@@ -69,4 +69,4 @@ If a candidate contains a PR number/URL or clearly concerns a PR, query live Git
 - After every candidate is recorded, call `finish` with the returned `run_id`, current time, and `window_start_ms`.
 - Do not archive, pin, delete, message, or otherwise mutate tasks.
 
-For manual recovery, run `title_event_worker.rb --allow-outside-hours --force-reconcile`; use `--dry-run` first when diagnosing candidate selection. The legacy `title_maintenance.rb run` path remains available for diagnosis only. Use `CODEX_TITLE_OWNER_ID` only when a deployment has a specific owner task to exclude; never bake a source-machine task ID into portable code. Never call `list_threads`, create a duplicate automation, or reactivate the retired hourly heartbeat.
+For manual recovery, run `title_event_worker.rb --force-reconcile`; use `--dry-run` first when diagnosing candidate selection. `--allow-outside-hours` remains a compatibility no-op for older commands. The legacy `title_maintenance.rb run` path remains available for diagnosis only. Use `CODEX_TITLE_OWNER_ID` only when a deployment has a specific owner task to exclude; never bake a source-machine task ID into portable code. Never call `list_threads`, create a duplicate automation, or reactivate the retired hourly heartbeat.

@@ -53,10 +53,10 @@ INSTALLER="${CODEX_HOME:-$HOME/.codex}/skills/codex-session-title-maintenance/sc
 
 ## Behavior
 
-- Beijing workdays, 09:00–18:00
+- always-on Stop-event processing
 - five-minute inactivity debounce
-- one recovery reconciliation of recent and pinned tasks per workday
-- PR metadata polling only for already-tracked active PRs
+- one recovery reconciliation of recent and pinned tasks per Beijing calendar day
+- ten-minute PR metadata polling only for already-tracked active PRs
 - status prefix: `🔄` `🟡` `⚠️` `⏸️` `✅` `⛔` `⏱️`
 - transient failures retry after ten minutes; a macOS notification is sent only after the second consecutive failure
 
@@ -69,4 +69,4 @@ ruby tests/title_event_test.rb
 ruby tests/title_maintenance_test.rb
 ```
 
-The tests cover queue debounce/retry, Stop-hook capture, Beijing hours, app-server transport, PR status mapping, stale-index recovery, and the native/manual-title concurrency guard.
+The tests cover queue debounce/retry, Stop-hook capture, Beijing-day reconciliation, always-on event handling, app-server transport, PR status mapping, stale-index recovery, and the native/manual-title concurrency guard.
