@@ -128,7 +128,7 @@ class TitleEventWorker
     processing_snapshot = ensure_retryable_snapshot(snapshot, candidates, now_ms)
     live_candidates = attach_live_versions(candidates, now_ms)
     enriched = enrich_candidates(live_candidates, processing_snapshot)
-    decisions = decisions_for(enriched, processing_snapshot)
+    decisions = decisions_for(enriched, processing_snapshot, now_ms)
     outcomes = apply_decisions(run_id, enriched, decisions, now_ms)
     @helper.finish(run_id: run_id, now_ms: now_ms, window_start_ms: window_start_ms)
     applied_ids = outcomes.reject { |outcome| outcome["action"] == "deferred" }.map { |outcome| outcome["id"] }
@@ -208,7 +208,7 @@ class TitleEventWorker
       @store.enqueue(candidate["id"], source: "reconcile", now_ms: now_ms, force: true)
     end
     current = @store.snapshot(now_ms: now_ms, idle_ms: 0)
-    candidates.each_with_object({}) do |candidate, result|
+    candidates.each_with_object(combined) do |candidate, result|
       entry = current[candidate["id"]] || combined[candidate["id"]]
       result[candidate["id"]] = entry if entry
     end
@@ -253,7 +253,7 @@ class TitleEventWorker
     client.close if client
   end
 
-  def decisions_for(candidates, snapshot)
+  def decisions_for(candidates, snapshot, now_ms)
     deterministic = []
     semantic = []
     candidates.each do |candidate|
@@ -261,9 +261,26 @@ class TitleEventWorker
       decision ? deterministic << decision : semantic << candidate
     end
 
-    semantic_decisions = semantic.each_slice(MODEL_BATCH_SIZE).flat_map { |batch| @decider.decide(batch) }
+    semantic_decisions = semantic.each_slice(MODEL_BATCH_SIZE).flat_map do |batch|
+      resilient_semantic_decisions(batch, now_ms)
+    end
     by_id = (deterministic + semantic_decisions).each_with_object({}) { |decision, result| result[decision["id"]] = decision }
     candidates.map { |candidate| by_id.fetch(candidate["id"]) }
+  end
+
+  def resilient_semantic_decisions(batch, now_ms)
+    @decider.decide(batch)
+  rescue TitleModelDecider::InvalidDecisionError => error
+    if batch.length > 1
+      midpoint = batch.length / 2
+      return resilient_semantic_decisions(batch.first(midpoint), now_ms) +
+        resilient_semantic_decisions(batch.drop(midpoint), now_ms)
+    end
+
+    candidate = batch.first
+    warn "Terra decision deferred #{candidate['id']}: #{error.message}"
+    @store.defer_until_idle(candidate["id"], source: "invalid-model-decision", now_ms: now_ms)
+    [{ "id" => candidate["id"], "action" => "deferred", "title" => nil, "reason" => error.message }]
   end
 
   def deterministic_pr_decision(candidate, event_entry)
@@ -291,6 +308,8 @@ class TitleEventWorker
 
     decisions.map do |decision|
       candidate = candidate_by_id.fetch(decision["id"])
+      next decision if decision["action"] == "deferred"
+
       live = client.read_thread(candidate["id"])
       unless live_thread_version(live) == candidate["live_version"]
         @store.defer_until_idle(candidate["id"], source: "changed-during-decision", now_ms: now_ms)

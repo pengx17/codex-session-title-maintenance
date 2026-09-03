@@ -327,10 +327,26 @@ class TitleEventWorkerReconciliationTest < Minitest::Test
     refute result["reconcile"]
     assert_equal [thread_id], helper.options[:thread_ids]
   end
+
+  def test_retryable_snapshot_keeps_due_events_that_no_longer_produce_candidates
+    old_id = "33333333-3333-7333-8333-333333333333"
+    candidate_id = "55555555-5555-7555-8555-555555555555"
+    Dir.mktmpdir do |dir|
+      store = TitleEventMaintenance::Store.new(root: dir)
+      store.enqueue(old_id, source: "stop", now_ms: 1_000, force: true)
+      snapshot = store.snapshot(now_ms: 2_000, idle_ms: 0)
+      worker = TitleEventWorker.new(store: store)
+
+      retryable = worker.send(:ensure_retryable_snapshot, snapshot, [{ "id" => candidate_id }], 2_000)
+
+      assert_equal [candidate_id, old_id].sort, retryable.keys.sort
+    end
+  end
 end
 
 class TitleEventWorkerConcurrencyTest < Minitest::Test
   THREAD_ID = "44444444-4444-7444-8444-444444444444"
+  SECOND_THREAD_ID = "66666666-6666-7666-8666-666666666666"
 
   class RecordingStore
     attr_reader :deferred
@@ -377,6 +393,28 @@ class TitleEventWorkerConcurrencyTest < Minitest::Test
     end
 
     def close; end
+  end
+
+  class SplittingDecider
+    attr_reader :batch_sizes
+
+    def initialize(always_fail: false)
+      @always_fail = always_fail
+      @batch_sizes = []
+    end
+
+    def valid_title?(_title)
+      false
+    end
+
+    def decide(candidates)
+      @batch_sizes << candidates.length
+      if @always_fail || candidates.length > 1
+        raise TitleModelDecider::InvalidDecisionError, "decision ids do not match candidates"
+      end
+
+      [{ "id" => candidates.first["id"], "action" => "keep", "title" => nil }]
+    end
   end
 
   def test_changed_native_or_manual_title_discards_stale_decision_and_requeues
@@ -445,5 +483,30 @@ class TitleEventWorkerConcurrencyTest < Minitest::Test
     notifier&.join
     reader&.close unless reader&.closed?
     writer&.close unless writer&.closed?
+  end
+
+
+  def test_invalid_batch_is_split_without_blocking_valid_singletons
+    decider = SplittingDecider.new
+    worker = TitleEventWorker.new(store: RecordingStore.new, decider: decider)
+    candidates = [THREAD_ID, SECOND_THREAD_ID].map do |id|
+      { "id" => id, "title" => "原生标题", "pull_requests" => [] }
+    end
+
+    decisions = worker.send(:decisions_for, candidates, {}, 2_000)
+
+    assert_equal [2, 1, 1], decider.batch_sizes
+    assert_equal ["keep", "keep"], decisions.map { |decision| decision["action"] }
+  end
+
+  def test_invalid_singleton_is_deferred_without_failing_other_work
+    store = RecordingStore.new
+    worker = TitleEventWorker.new(store: store, decider: SplittingDecider.new(always_fail: true))
+    candidate = { "id" => THREAD_ID, "title" => "原生标题", "pull_requests" => [] }
+
+    decisions = worker.send(:decisions_for, [candidate], {}, 2_000)
+
+    assert_equal "deferred", decisions.first["action"]
+    assert_equal "invalid-model-decision", store.deferred.first["source"]
   end
 end
