@@ -1,6 +1,21 @@
 # Codex Session Title Maintenance
 
-Event-driven Codex task-title maintenance for macOS. It uses a trusted Codex `Stop` hook, a durable local queue, a Beijing-work-hours `launchd` worker, live PR metadata, and a bounded Codex model pass to keep task titles accurate and searchable.
+Event-driven Codex task-title maintenance for macOS. It uses a trusted Codex `Stop` hook, a durable local queue, an always-on per-user `launchd` worker, live PR metadata, and a bounded Codex model pass to keep task titles accurate and searchable.
+
+## What this is
+
+This repository is an installable Codex Skill with a small local runtime:
+
+- `SKILL.md` defines when Codex should use it and the title/status policy.
+- `scripts/` implements event capture, durable processing, model decisions, PR-state tracking, installation, and diagnostics.
+- A per-user LaunchAgent runs the worker in the background on macOS.
+
+It is not a Codex plugin or an hourly scheduled task. The primary path is event-driven and runs whenever a Codex task stops, regardless of weekday or time of day. A once-per-Beijing-day reconciliation exists only to recover missed events and include pinned tasks.
+
+```text
+Codex Stop hook -> durable queue -> five-minute debounce
+                -> launchd worker -> verified Codex title write
+```
 
 ## Native-title compatibility
 
@@ -21,7 +36,13 @@ The worker never edits Codex databases, rollouts, or `session_index.jsonl` direc
 - GitHub CLI (`gh`) authenticated when PR-aware titles are needed
 - A model available to Codex; defaults are `gpt-5.6-terra` with `high` reasoning
 
-## Install
+### Why Ruby?
+
+The runtime intentionally uses only the Ruby standard library so installation does not require a package manager, virtual environment, or downloaded dependencies on Macs that provide `/usr/bin/ruby`. LaunchAgents and hooks can invoke the same absolute executable in a minimal environment.
+
+This is a deployment tradeoff, not a claim that Ruby is the best language for the domain. The scripts remain compatible with the older system Ruby used by supported installations. If the project grows into a broader cross-platform service, a managed Python runtime or a single compiled binary may become a better fit.
+
+## Quick start
 
 ```bash
 CODEX_ROOT="${CODEX_HOME:-$HOME/.codex}"
@@ -33,6 +54,8 @@ git clone https://github.com/pengx17/codex-session-title-maintenance.git \
 ```
 
 The installer merges the Stop hook, records trust through Codex, installs/restarts the per-user LaunchAgent, and runs an isolated end-to-end Stop-to-queue canary. The machine-specific `config/pinned-thread-ids.txt` is gitignored and is never published.
+
+The command is idempotent, so it is also the repair path. It preserves unrelated Codex hooks and regenerates machine-specific paths and trust data locally.
 
 Update an existing clone with:
 
@@ -54,6 +77,7 @@ INSTALLER="${CODEX_HOME:-$HOME/.codex}/skills/codex-session-title-maintenance/sc
 ## Behavior
 
 - always-on Stop-event processing
+- no working-hours restriction for queued Stop or PR events
 - five-minute inactivity debounce
 - one recovery reconciliation of recent and pinned tasks per Beijing calendar day
 - ten-minute PR metadata polling only for already-tracked active PRs
