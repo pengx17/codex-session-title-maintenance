@@ -7,6 +7,11 @@ require_relative "title_event_store"
 
 OWNER_THREAD_ID = ENV["CODEX_TITLE_OWNER_ID"]
 LAUNCH_AGENT_LABEL = ENV.fetch("CODEX_TITLE_LAUNCH_AGENT_LABEL", "local.codex-session-title-maintenance")
+EVENT_SOURCES = {
+  "sessionstart" => "session-start",
+  "userpromptsubmit" => "user-prompt",
+  "stop" => "stop"
+}.freeze
 
 def extract_thread_id(payload)
   values = [payload["thread_id"], payload["threadId"], payload["session_id"], payload["sessionId"]]
@@ -48,10 +53,12 @@ begin
   raw = STDIN.read
   payload = raw.strip.empty? ? {} : JSON.parse(raw)
   event_name = payload["hook_event_name"] || payload["event"]
-  exit 0 if event_name && event_name != "Stop"
+  event_source = EVENT_SOURCES[event_name.to_s.downcase]
+  exit 0 unless event_source
   thread_id = extract_thread_id(payload)
 
   if (canary_path = ENV["CODEX_TITLE_CANARY_PATH"])
+    exit 0 unless event_source == "stop"
     raise "Stop canary payload did not contain a valid thread id" unless thread_id
 
     store = TitleEventMaintenance::Store.new
@@ -72,7 +79,11 @@ begin
   exit 0 if thread_id == OWNER_THREAD_ID
 
   store = TitleEventMaintenance::Store.new
-  store.enqueue(thread_id, source: "stop")
+  store.enqueue(
+    thread_id,
+    source: event_source,
+    delay_ms: TitleEventMaintenance::EVENT_DELAYS_MS.fetch(event_source)
+  )
   wake_worker(store)
 rescue StandardError => error
   root = ENV.fetch("CODEX_TITLE_EVENT_ROOT", TitleEventMaintenance::Store::DEFAULT_ROOT)

@@ -62,6 +62,13 @@ class TitleEventStoreTest < Minitest::Test
       Time.new(2026, 8, 21, 16, 0, 0, "+00:00")
     )
   end
+
+  def test_event_specific_delay_controls_when_queue_entry_is_due
+    @store.enqueue(THREAD_ID, source: "user-prompt", now_ms: 1_000, delay_ms: 20_000)
+
+    assert_empty @store.snapshot(now_ms: 20_999, idle_ms: 300_000)
+    assert_equal [THREAD_ID], @store.snapshot(now_ms: 21_000, idle_ms: 300_000).keys
+  end
 end
 
 class TitleEventHookTest < Minitest::Test
@@ -106,6 +113,24 @@ class TitleEventHookTest < Minitest::Test
       assert_equal 1, TitleEventMaintenance::Store.new(root: dir).queue_size
     end
   end
+  def test_prompt_and_session_start_hooks_enqueue_the_thread
+    %w[UserPromptSubmit SessionStart].each do |event_name|
+      Dir.mktmpdir do |dir|
+        hook = File.expand_path("../scripts/title_event_hook.rb", __dir__)
+        payload = { "hook_event_name" => event_name, "session_id" => THREAD_ID }.to_json
+        _stdout, stderr, status = Open3.capture3(
+          { "CODEX_TITLE_EVENT_ROOT" => dir, "CODEX_TITLE_EVENT_DISABLE_WAKE" => "1" },
+          RbConfig.ruby,
+          "--disable=gems",
+          hook,
+          stdin_data: payload
+        )
+        assert status.success?, stderr
+        queue = JSON.parse(File.read(File.join(dir, "queue.json")))
+        assert_includes queue.dig("threads", THREAD_ID, "sources"), event_name == "UserPromptSubmit" ? "user-prompt" : "session-start"
+      end
+    end
+  end
 end
 
 class TitleEventInstallerTest < Minitest::Test
@@ -126,6 +151,8 @@ class TitleEventInstallerTest < Minitest::Test
     commands = merged.dig("hooks", "Stop").flat_map { |group| group.fetch("hooks") }.map { |hook| hook["command"] }
 
     assert_equal ["other-hook", command], commands
+    assert_equal [command], merged.dig("hooks", "SessionStart").flat_map { |group| group.fetch("hooks") }.map { |hook| hook["command"] }
+    assert_equal [command], merged.dig("hooks", "UserPromptSubmit").flat_map { |group| group.fetch("hooks") }.map { |hook| hook["command"] }
     assert_equal merged, twice
   end
 
@@ -328,6 +355,33 @@ class TitleEventWorkerReconciliationTest < Minitest::Test
     assert_equal [thread_id], helper.options[:thread_ids]
   end
 
+  def test_daemon_startup_warmup_is_independent_of_daily_reconciliation
+    store = Class.new(FakeStore) do
+      def read_state
+        { "last_reconcile_date" => "2026-08-24", "last_startup_warmup_ms" => 0 }
+      end
+    end.new
+    worker = TitleEventWorker.new(
+      store: store,
+      helper: FakeHelper.new,
+      now: -> { Time.new(2026, 8, 24, 10, 0, 0, "+08:00") }
+    )
+
+    assert worker.send(:startup_warmup_due?, Time.new(2026, 8, 24, 10, 0, 0, "+08:00"))
+  end
+
+  def test_recent_successful_startup_warmup_prevents_restart_churn
+    Dir.mktmpdir do |dir|
+      store = TitleEventMaintenance::Store.new(root: dir)
+      current_time = Time.new(2026, 8, 24, 10, 0, 0, "+08:00")
+      now_ms = (current_time.to_r * 1000).to_i
+      store.update_state { |state| state["last_startup_warmup_ms"] = now_ms - 60_000 }
+      worker = TitleEventWorker.new(store: store, now: -> { current_time })
+
+      refute worker.send(:startup_warmup_due?, current_time)
+    end
+  end
+
   def test_retryable_snapshot_keeps_due_events_that_no_longer_produce_candidates
     old_id = "33333333-3333-7333-8333-333333333333"
     candidate_id = "55555555-5555-7555-8555-555555555555"
@@ -369,6 +423,10 @@ class TitleEventWorkerConcurrencyTest < Minitest::Test
 
     def record(**options)
       @records << options
+    end
+
+    def lookup(_thread_id, **_options)
+      { "updated_at_ms" => 2_001 }
     end
   end
 
@@ -450,6 +508,39 @@ class TitleEventWorkerConcurrencyTest < Minitest::Test
     assert_equal "changed-during-decision", store.deferred.first["source"]
   end
 
+  def test_active_prompt_can_update_title_while_thread_timestamp_is_advancing
+    store = RecordingStore.new
+    helper = RecordingHelper.new
+    client = ChangingClient.new(
+      "name" => "旧目标",
+      "updatedAt" => 101,
+      "status" => { "type" => "active" }
+    )
+    worker = TitleEventWorker.new(
+      store: store,
+      helper: helper,
+      app_client_factory: -> { client }
+    )
+    candidate = {
+      "id" => THREAD_ID,
+      "title" => "旧目标",
+      "updated_at_ms" => 1_000,
+      "event_sources" => ["user-prompt"],
+      "pull_requests" => [],
+      "live_version" => {
+        "name" => "旧目标",
+        "updatedAt" => 100,
+        "status" => { "type" => "active" }
+      }
+    }
+    decision = { "id" => THREAD_ID, "action" => "rename", "title" => "🔄 新目标" }
+
+    outcomes = worker.send(:apply_decisions, "run-id", [candidate], [decision], 2_000)
+
+    assert_equal "rename", outcomes.first["action"]
+    assert_equal [[THREAD_ID, "🔄 新目标"]], client.set_calls
+  end
+
   def test_attach_live_versions_collects_named_threads_without_filter_map
     store = RecordingStore.new
     client = ChangingClient.new(
@@ -508,5 +599,18 @@ class TitleEventWorkerConcurrencyTest < Minitest::Test
 
     assert_equal "deferred", decisions.first["action"]
     assert_equal "invalid-model-decision", store.deferred.first["source"]
+  end
+  def test_active_prompt_decision_cannot_claim_non_pr_completion
+    worker = TitleEventWorker.allocate
+    candidate = {
+      "id" => THREAD_ID,
+      "event_sources" => ["user-prompt"],
+      "pull_requests" => []
+    }
+    decision = { "id" => THREAD_ID, "action" => "rename", "title" => "✅ 完成迁移" }
+
+    normalized = worker.send(:normalize_provisional_decisions, [candidate], [decision])
+
+    assert_equal "🔄 完成迁移", normalized.first["title"]
   end
 end

@@ -12,9 +12,10 @@ require_relative "title_model_decider"
 require_relative "title_pr_resolver"
 
 class TitleEventWorker
-  IDLE_MS = 5 * 60 * 1000
+  IDLE_MS = 90 * 1000
   RETRY_MS = 10 * 60 * 1000
   PR_POLL_MS = 10 * 60 * 1000
+  STARTUP_WARMUP_COOLDOWN_MS = 30 * 60 * 1000
   PR_BOOTSTRAP_VERSION = 2
   MODEL_BATCH_SIZE = 8
   def initialize(
@@ -168,9 +169,14 @@ class TitleEventWorker
 
   def daemon_loop
     last_result = { "status" => "finished", "reason" => "daemon_started" }
+    startup_warmup_pending = startup_warmup_due?(@now.call)
     loop do
       current_time = @now.call
-      last_result = run_locked(current_time, force_reconcile: false, dry_run: false)
+      last_result = run_locked(current_time, force_reconcile: startup_warmup_pending, dry_run: false)
+      if startup_warmup_pending && last_result["status"] == "finished" && last_result["reason"] != "retry_pending"
+        mark_startup_warmup_success(current_time)
+        startup_warmup_pending = false
+      end
       sleep_seconds = next_wake_seconds(@now.call)
       wait_for_wake(sleep_seconds)
     end
@@ -265,7 +271,23 @@ class TitleEventWorker
       resilient_semantic_decisions(batch, now_ms)
     end
     by_id = (deterministic + semantic_decisions).each_with_object({}) { |decision, result| result[decision["id"]] = decision }
-    candidates.map { |candidate| by_id.fetch(candidate["id"]) }
+    decisions = candidates.map { |candidate| by_id.fetch(candidate["id"]) }
+    normalize_provisional_decisions(candidates, decisions)
+  end
+
+  def normalize_provisional_decisions(candidates, decisions)
+    candidates_by_id = candidates.each_with_object({}) { |candidate, result| result[candidate["id"]] = candidate }
+    decisions.map do |decision|
+      candidate = candidates_by_id.fetch(decision["id"])
+      sources = Array(candidate["event_sources"])
+      provisional = sources.include?("user-prompt") && (sources & %w[stop pr-status pr-content]).empty?
+      next decision unless provisional && Array(candidate["pull_requests"]).empty? && decision["action"] == "rename"
+
+      current_status = TitleModelDecider::STATUS_EMOJIS.find { |emoji| decision["title"].to_s.start_with?(emoji) }
+      next decision unless current_status && current_status != "🔄"
+
+      decision.merge("title" => "🔄#{decision['title'][current_status.length..-1]}")
+    end
   end
 
   def resilient_semantic_decisions(batch, now_ms)
@@ -311,7 +333,7 @@ class TitleEventWorker
       next decision if decision["action"] == "deferred"
 
       live = client.read_thread(candidate["id"])
-      unless live_thread_version(live) == candidate["live_version"]
+      unless compatible_live_version?(candidate, live)
         @store.defer_until_idle(candidate["id"], source: "changed-during-decision", now_ms: now_ms)
         next decision.merge("action" => "deferred", "title" => nil, "reason" => "task changed while title decision was in flight")
       end
@@ -351,6 +373,35 @@ class TitleEventWorker
       "updatedAt" => thread["updatedAt"],
       "status" => thread["status"]
     }
+  end
+
+  def compatible_live_version?(candidate, live)
+    return live_thread_version(live) == candidate["live_version"] unless provisional_candidate?(candidate)
+
+    original = candidate.fetch("live_version")
+    live["name"].to_s == original["name"].to_s &&
+      thread_status_type(live["status"]) == "active" &&
+      thread_status_type(original["status"]) == "active"
+  end
+
+  def provisional_candidate?(candidate)
+    sources = Array(candidate["event_sources"])
+    sources.include?("user-prompt") && (sources & %w[stop pr-status pr-content]).empty? && Array(candidate["pull_requests"]).empty?
+  end
+
+  def thread_status_type(status)
+    status.is_a?(Hash) ? status["type"].to_s : status.to_s
+  end
+
+  def startup_warmup_due?(current_time)
+    now_ms = (current_time.to_r * 1000).to_i
+    last_ms = integer(@store.read_state["last_startup_warmup_ms"])
+    now_ms - last_ms >= STARTUP_WARMUP_COOLDOWN_MS
+  end
+
+  def mark_startup_warmup_success(current_time)
+    now_ms = (current_time.to_r * 1000).to_i
+    @store.update_state { |state| state["last_startup_warmup_ms"] = now_ms }
   end
 
   def bootstrap_pr_registry(now_ms)
