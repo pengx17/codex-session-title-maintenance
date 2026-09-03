@@ -109,6 +109,8 @@ class TitleEventWorker
       force_thread_ids: forced_ids,
       refresh_scope: reconcile
     )
+    return prepared.merge("queue_size" => @store.queue_size) unless prepared["status"] == "ready"
+
     if dry_run
       return prepared.merge("queue_snapshot" => snapshot, "reconcile" => reconcile)
     end
