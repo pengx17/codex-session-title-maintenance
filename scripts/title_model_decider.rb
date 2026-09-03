@@ -101,6 +101,8 @@ class TitleModelDecider
         "currentTitle" => candidate["title"],
         "cwd" => candidate.dig("context", "cwd"),
         "messages" => Array(candidate.dig("context", "messages")),
+        "eventSources" => Array(candidate["event_sources"]),
+        "threadStatus" => candidate.dig("live_version", "status"),
         "pullRequests" => Array(candidate["pull_requests"]).map do |pr|
           pr.reject { |key, _| key == "statusCheckRollup" || key == "fingerprint" }
         end
@@ -112,6 +114,7 @@ class TitleModelDecider
       标题格式：状态 emoji + 可选稳定标签 + 简洁中文主题。状态 emoji 必须是首字符，并且标题中不得再有装饰 emoji。
       状态仅用：🔄 实现中或 Draft；🟡 open 非 Draft、CI、review 或 merge-ready；⚠️ 明确 blocker 或失败门禁；⏸️ 等待外部、用户或验收；✅ 已完成或 merged；⛔ closed 未合并；⏱️ 周期巡检。
       idle 不等于完成。实时 pullRequests metadata 高于历史对话；其 statusEmoji 应作为 PR session 的首字符。
+      eventSources 包含 user-prompt 且不包含 stop 时，这是长任务开始后的快速标题阶段：标题应反映最新用户目标，非 PR 标题只能使用 🔄，不得宣称完成或等待。后续 stop 事件会用完整结果校正状态。
       只有当前标题过泛、失真、缺少关键项目/PR/主题或状态变化时才 rename，否则 keep。
       保留稳定项目标签，例如 [Project]、[Project PR #123]。主题尽量使用中文；专有名词、PR 编号和 RFC 名称可保留英文。
       每个输入 id 必须且只能返回一个 decision。keep 的 title 必须为 null；rename 的 title 必须是完整新标题。

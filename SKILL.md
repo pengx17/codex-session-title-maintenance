@@ -12,15 +12,16 @@ Apply only to Codex tasks, never ChatGPT conversations.
 The installed flow is:
 
 ```text
-Codex Stop hook -> durable queue -> launchd worker -> verified Codex title write
+SessionStart/UserPromptSubmit/Stop hooks -> durable queue -> launchd worker -> verified Codex title write
 ```
 
-- `title_event_hook.rb` queues the stopped thread and wakes the worker without blocking or failing the Codex session.
-- Codex owns the initial task title. `title_event_worker.rb --daemon` is an always-on delayed second pass: it waits for five minutes of thread inactivity and batches semantic decisions. Stop events are processed regardless of weekday or clock time.
-- Explicit Stop/PR events bypass the stale `session_index.jsonl` timestamp filter after the inactivity wait. Before deciding, read the live Codex title/version; immediately before writing, read it again. If the native title, manual title, task status, or task version changed, discard the old decision and requeue after another inactivity window.
+- `title_event_hook.rb` captures task start, new user goals, and completed turns without blocking or failing the Codex session.
+- Codex owns the initial task title. A user prompt starts a fast provisional pass after 20 seconds so long-running tasks do not keep a stale title; non-PR provisional titles remain `🔄`. A Stop event schedules a final pass after 90 seconds so completed context and status can correct the title.
+- `title_event_worker.rb --daemon` is always on and batches semantic decisions. Events are processed regardless of weekday or clock time.
+- Explicit lifecycle/PR events bypass the stale `session_index.jsonl` timestamp filter after their debounce. Before deciding, read the live Codex title/version; immediately before writing, read it again. A provisional active-task decision may tolerate timestamp-only progress, but any title change still discards the stale decision. Final decisions also require the task status and version to remain unchanged.
 - Poll only already-tracked open PR metadata every ten minutes. PR status-class changes are deterministic and do not invoke a model. Use `gpt-5.6-terra` at `high` only for semantic title decisions.
 - Keep executables separate: use the configured CLI for Terra decisions, and the Desktop-bundled Codex binary for the short-lived writable app-server. Do not substitute an older standalone stdio app-server.
-- Reconcile recent and pinned threads once per Beijing calendar day as a loss-recovery path; this is not an hourly model scan.
+- On worker startup, reconcile recent and pinned threads as a loss-recovery warmup, with a 30-minute persisted cooldown to prevent crash-loop model churn. Also reconcile once per Beijing calendar day while the daemon remains alive; neither path is an hourly model scan.
 - A transient failure waits ten minutes. Notify through macOS only after the second consecutive failure; never create a Codex inbox item.
 
 Core scripts:
@@ -42,7 +43,7 @@ INSTALLER="${CODEX_HOME:-$HOME/.codex}/skills/codex-session-title-maintenance/sc
 /usr/bin/ruby --disable=gems "$INSTALLER" doctor
 ```
 
-The installer is idempotent. It derives the current home and Codex directories, finds Apple Silicon or Intel Homebrew executables, preserves unrelated hooks, writes trust through Codex `config/batchWrite`, and safely reloads an always-on launchd worker. A successful install requires one enabled Stop hook with `trust_status=trusted`, a loaded valid LaunchAgent, a paused-or-absent legacy heartbeat, and a real Stop canary that verifies thread-id extraction and an isolated durable-queue write.
+The installer is idempotent. It derives the current home and Codex directories, finds Apple Silicon or Intel Homebrew executables, preserves unrelated hooks, writes trust through Codex `config/batchWrite`, and safely reloads an always-on launchd worker. A successful install requires one enabled and trusted hook for each supported title event, a loaded valid LaunchAgent, a paused-or-absent legacy heartbeat, and a real Stop canary that verifies thread-id extraction and an isolated durable-queue write.
 
 To migrate, first verify the target's identity; never infer it from the nearest SSH alias. For a LAN Mac, resolve its Bonjour SSH service and confirm hostname, user, architecture, GUI launchd domain, and Codex home before copying anything. Then copy this entire skill directory into the target Mac's `$CODEX_HOME/skills/` and run the same `install --canary` command from that Mac's logged-in GUI user. Preflight Codex/app-server, `gh`, filesystem paths, network reachability, and existing host authentication before requesting any new login. Never copy source-machine absolute paths or trusted hashes; the target installer regenerates both.
 

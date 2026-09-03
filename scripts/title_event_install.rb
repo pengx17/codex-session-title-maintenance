@@ -19,6 +19,7 @@ class TitleEventInstaller
   DEFAULT_LABEL = "local.codex-session-title-maintenance"
   HOOK_TIMEOUT_SECONDS = 5
   CANARY_TIMEOUT_SECONDS = 120
+  HOOK_EVENTS = %w[SessionStart UserPromptSubmit Stop].freeze
 
   attr_reader :home, :codex_home, :skill_root, :hooks_path, :plist_path, :label
 
@@ -100,10 +101,12 @@ class TitleEventInstaller
       "schedule" => {
         "event_processing" => "always_on",
         "pr_poll_seconds" => TitleEventWorker::PR_POLL_MS / 1000,
+        "startup_warmup_cooldown_seconds" => TitleEventWorker::STARTUP_WARMUP_COOLDOWN_MS / 1000,
         "reconciliation" => "once_per_beijing_calendar_day"
       },
       "binaries" => binaries,
       "queue_size" => store.queue_size,
+      "last_startup_warmup_ms" => state["last_startup_warmup_ms"],
       "last_reconcile_date" => state["last_reconcile_date"],
       "worker_retry_attempts" => state["worker_retry_attempts"],
       "worker_error_log_bytes" => File.file?(errors_path) ? File.size(errors_path) : 0,
@@ -181,29 +184,31 @@ class TitleEventInstaller
   def self.merge_hook_document(document, command)
     result = JSON.parse(JSON.generate(document || {}))
     result["hooks"] = {} unless result["hooks"].is_a?(Hash)
-    groups = Array(result["hooks"]["Stop"])
-    cleaned = groups.each_with_object([]) do |group, output|
-      next unless group.is_a?(Hash)
+    HOOK_EVENTS.each do |event_name|
+      groups = Array(result["hooks"][event_name])
+      cleaned = groups.each_with_object([]) do |group, output|
+        next unless group.is_a?(Hash)
 
-      copy = JSON.parse(JSON.generate(group))
-      handlers = Array(copy["hooks"]).reject do |handler|
-        title_hook_command?(handler["command"])
+        copy = JSON.parse(JSON.generate(group))
+        handlers = Array(copy["hooks"]).reject do |handler|
+          title_hook_command?(handler["command"])
+        end
+        next if handlers.empty?
+
+        copy["hooks"] = handlers
+        output << copy
       end
-      next if handlers.empty?
-
-      copy["hooks"] = handlers
-      output << copy
+      cleaned << {
+        "hooks" => [
+          {
+            "command" => command,
+            "timeout" => HOOK_TIMEOUT_SECONDS,
+            "type" => "command"
+          }
+        ]
+      }
+      result["hooks"][event_name] = cleaned
     end
-    cleaned << {
-      "hooks" => [
-        {
-          "command" => command,
-          "timeout" => HOOK_TIMEOUT_SECONDS,
-          "type" => "command"
-        }
-      ]
-    }
-    result["hooks"]["Stop"] = cleaned
     result
   end
 
@@ -241,53 +246,67 @@ class TitleEventInstaller
   end
 
   def trust_hook
-    entry = nil
+    entries = nil
     @app_client_factory.call.connect do |client|
-      matches = client.list_hooks(cwds: [@home]).select do |hook|
-        hook["eventName"].to_s.casecmp("stop").zero? && hook["command"] == hook_command
+      entries = matching_hook_entries(client.list_hooks(cwds: [@home]))
+      validate_hook_entries!(entries)
+      writes = entries.reject { |entry| entry["trustStatus"] == "trusted" }.map do |entry|
+        {
+          "keyPath" => self.class.trust_key_path(entry.fetch("key")),
+          "value" => entry.fetch("currentHash"),
+          "mergeStrategy" => "upsert"
+        }
       end
-      raise "expected exactly one installed Stop hook, found #{matches.length}" unless matches.length == 1
-
-      entry = matches.first
-      unless entry["trustStatus"] == "trusted"
+      unless writes.empty?
         client.batch_write_config(
-          [
-            {
-              "keyPath" => self.class.trust_key_path(entry.fetch("key")),
-              "value" => entry.fetch("currentHash"),
-              "mergeStrategy" => "upsert"
-            }
-          ]
+          writes
         )
       end
     end
 
     verified = hook_health
-    raise "Codex did not persist trust for #{entry['key']}" unless verified["ok"]
+    raise "Codex did not persist trust for all title hooks" unless verified["ok"]
 
     {
-      "key" => entry["key"],
-      "hash" => entry["currentHash"],
+      "events" => verified["events"],
       "status" => "trusted"
     }
   end
 
   def hook_health
-    matches = nil
+    entries = nil
     @app_client_factory.call.connect do |client|
-      matches = client.list_hooks(cwds: [@home]).select do |hook|
-        hook["eventName"].to_s.casecmp("stop").zero? && hook["command"] == hook_command
-      end
+      entries = matching_hook_entries(client.list_hooks(cwds: [@home]))
     end
-    entry = matches.first
+    events = HOOK_EVENTS.each_with_object({}) do |event_name, result|
+      matches = entries.select { |entry| entry["eventName"].to_s.casecmp(event_name).zero? }
+      entry = matches.first
+      result[event_name] = {
+        "ok" => matches.length == 1 && entry["enabled"] && entry["trustStatus"] == "trusted",
+        "matching_entries" => matches.length,
+        "enabled" => entry && entry["enabled"],
+        "trust_status" => entry && entry["trustStatus"],
+        "key" => entry && entry["key"],
+        "current_hash" => entry && entry["currentHash"]
+      }
+    end
     {
-      "ok" => matches.length == 1 && entry["enabled"] && entry["trustStatus"] == "trusted",
-      "matching_entries" => matches.length,
-      "enabled" => entry && entry["enabled"],
-      "trust_status" => entry && entry["trustStatus"],
-      "key" => entry && entry["key"],
-      "current_hash" => entry && entry["currentHash"]
+      "ok" => events.values.all? { |event| event["ok"] },
+      "events" => events
     }
+  end
+
+  def matching_hook_entries(entries)
+    Array(entries).select do |hook|
+      HOOK_EVENTS.any? { |event_name| hook["eventName"].to_s.casecmp(event_name).zero? } && hook["command"] == hook_command
+    end
+  end
+
+  def validate_hook_entries!(entries)
+    HOOK_EVENTS.each do |event_name|
+      count = entries.count { |entry| entry["eventName"].to_s.casecmp(event_name).zero? }
+      raise "expected exactly one installed #{event_name} hook, found #{count}" unless count == 1
+    end
   end
 
   def write_launch_agent

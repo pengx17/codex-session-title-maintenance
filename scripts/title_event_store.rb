@@ -9,6 +9,11 @@ require "time"
 module TitleEventMaintenance
   THREAD_ID_PATTERN = /\A[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\z/i.freeze
   WORKER_ENV = "CODEX_TITLE_MAINTENANCE_WORKER"
+  EVENT_DELAYS_MS = {
+    "session-start" => 30_000,
+    "user-prompt" => 20_000,
+    "stop" => 90_000
+  }.freeze
 
   module_function
 
@@ -56,19 +61,21 @@ module TitleEventMaintenance
       FileUtils.mkdir_p(root, mode: 0o700)
     end
 
-    def enqueue(thread_id, source:, now_ms: TitleEventMaintenance.now_ms, force: false)
+    def enqueue(thread_id, source:, now_ms: TitleEventMaintenance.now_ms, force: false, delay_ms: nil)
       raise ArgumentError, "invalid Codex thread id: #{thread_id.inspect}" unless TitleEventMaintenance.valid_thread_id?(thread_id)
 
       with_lock(@queue_lock_path) do
         queue = load_json(@queue_path, empty_queue)
         queue["revision"] = integer(queue["revision"]) + 1
         current = queue.fetch("threads", {})[thread_id] || {}
+        not_before_ms = delay_ms.nil? ? integer(current["not_before_ms"]) : Integer(now_ms) + Integer(delay_ms)
         queue["threads"] ||= {}
         queue["threads"][thread_id] = {
           "queued_at_ms" => [integer(current["queued_at_ms"]), Integer(now_ms)].max,
           "revision" => queue["revision"],
           "sources" => (Array(current["sources"]) + [source.to_s]).uniq.sort,
           "force" => !!current["force"] || !!force,
+          "not_before_ms" => [integer(current["not_before_ms"]), not_before_ms].max,
           "attempts" => 0,
           "next_retry_at_ms" => 0,
           "last_error" => nil
@@ -109,7 +116,14 @@ module TitleEventMaintenance
         queue = load_json(@queue_path, empty_queue)
         queue.fetch("threads", {}).each_with_object({}) do |(thread_id, entry), result|
           next if integer(entry["next_retry_at_ms"]) > now_ms
-          next unless entry["force"] || now_ms - integer(entry["queued_at_ms"]) >= idle_ms
+          due = if entry["force"]
+                  true
+                elsif integer(entry["not_before_ms"]).positive?
+                  now_ms >= integer(entry["not_before_ms"])
+                else
+                  now_ms - integer(entry["queued_at_ms"]) >= idle_ms
+                end
+          next unless due
 
           result[thread_id] = deep_copy(entry)
         end
@@ -121,7 +135,13 @@ module TitleEventMaintenance
         queue = load_json(@queue_path, empty_queue)
         waits = queue.fetch("threads", {}).values.map do |entry|
           retry_wait = integer(entry["next_retry_at_ms"]) - now_ms
-          idle_wait = entry["force"] ? 0 : integer(entry["queued_at_ms"]) + idle_ms - now_ms
+          idle_wait = if entry["force"]
+                        0
+                      elsif integer(entry["not_before_ms"]).positive?
+                        integer(entry["not_before_ms"]) - now_ms
+                      else
+                        integer(entry["queued_at_ms"]) + idle_ms - now_ms
+                      end
           [retry_wait, idle_wait, 0].max
         end
         waits.empty? ? nil : (waits.min / 1000.0).ceil
@@ -214,6 +234,7 @@ module TitleEventMaintenance
       {
         "version" => 1,
         "bootstrap_completed" => false,
+        "last_startup_warmup_ms" => 0,
         "last_reconcile_date" => nil,
         "last_pr_poll_ms" => 0,
         "prs" => {},
