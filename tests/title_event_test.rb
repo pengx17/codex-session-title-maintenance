@@ -57,11 +57,10 @@ class TitleEventStoreTest < Minitest::Test
     assert_equal 1, @store.queue_size
   end
 
-  def test_business_hours_are_beijing_weekdays_only
-    assert TitleEventMaintenance::BusinessHours.open?(Time.new(2026, 8, 21, 9, 0, 0, "+08:00"))
-    assert TitleEventMaintenance::BusinessHours.open?(Time.new(2026, 8, 21, 18, 0, 0, "+08:00"))
-    refute TitleEventMaintenance::BusinessHours.open?(Time.new(2026, 8, 21, 18, 1, 0, "+08:00"))
-    refute TitleEventMaintenance::BusinessHours.open?(Time.new(2026, 8, 22, 10, 0, 0, "+08:00"))
+  def test_reconciliation_date_uses_beijing_calendar_day
+    assert_equal "2026-08-22", TitleEventMaintenance::BeijingCalendar.date(
+      Time.new(2026, 8, 21, 16, 0, 0, "+00:00")
+    )
   end
 end
 
@@ -135,10 +134,23 @@ class TitleEventInstallerTest < Minitest::Test
     assert_equal %(hooks.state."#{key}".trusted_hash), TitleEventInstaller.trust_key_path(key)
   end
 
-  def test_beijing_nine_maps_to_tokyo_ten
-    tokyo = Time.new(2026, 8, 24, 12, 0, 0, "+09:00")
-    assert_equal({ "Hour" => 10, "Minute" => 0, "Weekday" => 1 }, TitleEventInstaller.local_start(tokyo))
+  def test_launch_agent_is_run_at_load_without_a_calendar_gate
+    installer = TitleEventInstaller.allocate
+    installer.instance_variable_set(:@app_server_bin, "/app-server")
+    installer.instance_variable_set(:@decision_codex, "/codex")
+    installer.instance_variable_set(:@gh_bin, "/gh")
+    installer.instance_variable_set(:@codex_home, "/tmp/codex")
+    installer.instance_variable_set(:@runtime_root, "/tmp/runtime")
+    installer.instance_variable_set(:@worker_script, "/tmp/worker.rb")
+    installer.instance_variable_set(:@label, "local.test")
+    installer.instance_variable_set(:@home, "/tmp/home")
+
+    plist = installer.send(:launch_agent_plist)
+
+    assert_includes plist, "<key>RunAtLoad</key>"
+    refute_includes plist, "StartCalendarInterval"
   end
+
 end
 
 class CodexAppServerClientTest < Minitest::Test
@@ -300,10 +312,41 @@ class TitleEventWorkerReconciliationTest < Minitest::Test
     assert_equal [thread_id], helper.options[:thread_ids]
     assert_equal [thread_id], helper.options[:force_thread_ids]
   end
+
+  def test_explicit_stop_event_runs_outside_the_former_business_hours
+    thread_id = "33333333-3333-7333-8333-333333333333"
+    helper = FakeHelper.new
+    worker = TitleEventWorker.new(
+      store: EventStore.new(thread_id),
+      helper: helper,
+      now: -> { Time.new(2026, 8, 24, 2, 0, 0, "+08:00") }
+    )
+
+    result = worker.run(dry_run: true)
+
+    refute result["reconcile"]
+    assert_equal [thread_id], helper.options[:thread_ids]
+  end
+
+  def test_retryable_snapshot_keeps_due_events_that_no_longer_produce_candidates
+    old_id = "33333333-3333-7333-8333-333333333333"
+    candidate_id = "55555555-5555-7555-8555-555555555555"
+    Dir.mktmpdir do |dir|
+      store = TitleEventMaintenance::Store.new(root: dir)
+      store.enqueue(old_id, source: "stop", now_ms: 1_000, force: true)
+      snapshot = store.snapshot(now_ms: 2_000, idle_ms: 0)
+      worker = TitleEventWorker.new(store: store)
+
+      retryable = worker.send(:ensure_retryable_snapshot, snapshot, [{ "id" => candidate_id }], 2_000)
+
+      assert_equal [candidate_id, old_id].sort, retryable.keys.sort
+    end
+  end
 end
 
 class TitleEventWorkerConcurrencyTest < Minitest::Test
   THREAD_ID = "44444444-4444-7444-8444-444444444444"
+  SECOND_THREAD_ID = "66666666-6666-7666-8666-666666666666"
 
   class RecordingStore
     attr_reader :deferred
@@ -352,6 +395,28 @@ class TitleEventWorkerConcurrencyTest < Minitest::Test
     def close; end
   end
 
+  class SplittingDecider
+    attr_reader :batch_sizes
+
+    def initialize(always_fail: false)
+      @always_fail = always_fail
+      @batch_sizes = []
+    end
+
+    def valid_title?(_title)
+      false
+    end
+
+    def decide(candidates)
+      @batch_sizes << candidates.length
+      if @always_fail || candidates.length > 1
+        raise TitleModelDecider::InvalidDecisionError, "decision ids do not match candidates"
+      end
+
+      [{ "id" => candidates.first["id"], "action" => "keep", "title" => nil }]
+    end
+  end
+
   def test_changed_native_or_manual_title_discards_stale_decision_and_requeues
     store = RecordingStore.new
     helper = RecordingHelper.new
@@ -383,5 +448,65 @@ class TitleEventWorkerConcurrencyTest < Minitest::Test
     assert_empty client.set_calls
     assert_empty helper.records
     assert_equal "changed-during-decision", store.deferred.first["source"]
+  end
+
+  def test_attach_live_versions_collects_named_threads_without_filter_map
+    store = RecordingStore.new
+    client = ChangingClient.new(
+      "name" => "Codex 原生标题",
+      "updatedAt" => 100,
+      "status" => { "type" => "idle" }
+    )
+    worker = TitleEventWorker.new(store: store, app_client_factory: -> { client })
+
+    candidates = worker.send(:attach_live_versions, [{ "id" => THREAD_ID }], 2_000)
+
+    assert_equal ["Codex 原生标题"], candidates.map { |candidate| candidate["title"] }
+  end
+
+  def test_daemon_wait_can_be_woken_without_waiting_for_the_timeout
+    worker = TitleEventWorker.allocate
+    reader, writer = IO.pipe
+    worker.instance_variable_set(:@wake_reader, reader)
+    worker.instance_variable_set(:@wake_writer, writer)
+    notifier = Thread.new do
+      sleep 0.02
+      writer.write(".")
+    end
+
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    worker.send(:wait_for_wake, 1)
+    elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+
+    assert_operator elapsed, :<, 0.5
+  ensure
+    notifier&.join
+    reader&.close unless reader&.closed?
+    writer&.close unless writer&.closed?
+  end
+
+
+  def test_invalid_batch_is_split_without_blocking_valid_singletons
+    decider = SplittingDecider.new
+    worker = TitleEventWorker.new(store: RecordingStore.new, decider: decider)
+    candidates = [THREAD_ID, SECOND_THREAD_ID].map do |id|
+      { "id" => id, "title" => "原生标题", "pull_requests" => [] }
+    end
+
+    decisions = worker.send(:decisions_for, candidates, {}, 2_000)
+
+    assert_equal [2, 1, 1], decider.batch_sizes
+    assert_equal ["keep", "keep"], decisions.map { |decision| decision["action"] }
+  end
+
+  def test_invalid_singleton_is_deferred_without_failing_other_work
+    store = RecordingStore.new
+    worker = TitleEventWorker.new(store: store, decider: SplittingDecider.new(always_fail: true))
+    candidate = { "id" => THREAD_ID, "title" => "原生标题", "pull_requests" => [] }
+
+    decisions = worker.send(:decisions_for, [candidate], {}, 2_000)
+
+    assert_equal "deferred", decisions.first["action"]
+    assert_equal "invalid-model-decision", store.deferred.first["source"]
   end
 end

@@ -8,6 +8,8 @@ require "timeout"
 require "tmpdir"
 
 class TitleModelDecider
+  class InvalidDecisionError < StandardError; end
+
   STATUS_EMOJIS = ["🔄", "🟡", "⚠️", "⏸️", "✅", "⛔", "⏱️"].freeze
   DEFAULT_SCHEMA = File.expand_path("../config/title-decisions.schema.json", __dir__)
 
@@ -73,7 +75,7 @@ class TitleModelDecider
       validate_decisions(parsed.fetch("decisions"), candidates)
     end
   rescue JSON::ParserError, KeyError => error
-    raise "invalid Terra title decision output: #{error.message}"
+    raise InvalidDecisionError, "invalid Terra title decision output: #{error.message}"
   end
 
   def valid_title?(title)
@@ -120,21 +122,27 @@ class TitleModelDecider
   end
 
   def validate_decisions(decisions, candidates)
-    raise "decisions must be an array" unless decisions.is_a?(Array)
+    raise InvalidDecisionError, "decisions must be an array" unless decisions.is_a?(Array)
 
     expected = candidates.map { |candidate| candidate.fetch("id") }.sort
     actual = decisions.map { |decision| decision["id"] }.sort
-    raise "decision ids do not match candidates" unless actual == expected && actual.uniq.length == actual.length
+    unless actual == expected && actual.uniq.length == actual.length
+      raise InvalidDecisionError, "decision ids do not match candidates"
+    end
 
     decisions.each do |decision|
       action = decision["action"]
       case action
       when "keep"
-        raise "keep decision must have null title for #{decision["id"]}" unless decision["title"].nil?
+        unless decision["title"].nil?
+          raise InvalidDecisionError, "keep decision must have null title for #{decision["id"]}"
+        end
       when "rename"
-        raise "invalid generated title for #{decision["id"]}: #{decision["title"].inspect}" unless valid_title?(decision["title"])
+        unless valid_title?(decision["title"])
+          raise InvalidDecisionError, "invalid generated title for #{decision["id"]}: #{decision["title"].inspect}"
+        end
       else
-        raise "invalid decision action for #{decision["id"]}: #{action.inspect}"
+        raise InvalidDecisionError, "invalid decision action for #{decision["id"]}: #{action.inspect}"
       end
     end
     decisions

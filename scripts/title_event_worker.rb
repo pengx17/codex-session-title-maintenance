@@ -37,9 +37,8 @@ class TitleEventWorker
 
   def run(allow_outside_hours: false, force_reconcile: false, dry_run: false)
     current_time = @now.call
-    unless allow_outside_hours || TitleEventMaintenance::BusinessHours.open?(current_time)
-      return { "status" => "skipped", "reason" => "outside_beijing_business_hours" }
-    end
+    # Kept as a no-op keyword for compatibility with older recovery commands.
+    _allow_outside_hours = allow_outside_hours
 
     result = nil
     locked = @store.with_worker_lock do
@@ -53,11 +52,18 @@ class TitleEventWorker
   def run_daemon
     result = nil
     locked = @store.with_worker_lock do
-      previous_handler = Signal.trap("USR1") { @wake_requested = true }
+      @wake_reader, @wake_writer = IO.pipe
+      previous_handler = Signal.trap("USR1") do
+        @wake_writer.write_nonblock(".", exception: false)
+      rescue IOError, SystemCallError
+        nil
+      end
       begin
         result = daemon_loop
       ensure
         Signal.trap("USR1", previous_handler)
+        @wake_reader.close unless @wake_reader.closed?
+        @wake_writer.close unless @wake_writer.closed?
       end
     end
     return { "status" => "skipped", "reason" => "worker_already_running" } unless locked
@@ -81,7 +87,7 @@ class TitleEventWorker
       poll_tracked_prs(now_ms)
     end
 
-    date = TitleEventMaintenance::BusinessHours.date(current_time)
+    date = TitleEventMaintenance::BeijingCalendar.date(current_time)
     event_state = @store.read_state
     reconcile = force_reconcile || event_state["last_reconcile_date"] != date
     snapshot = @store.snapshot(now_ms: now_ms, idle_ms: IDLE_MS)
@@ -122,7 +128,7 @@ class TitleEventWorker
     processing_snapshot = ensure_retryable_snapshot(snapshot, candidates, now_ms)
     live_candidates = attach_live_versions(candidates, now_ms)
     enriched = enrich_candidates(live_candidates, processing_snapshot)
-    decisions = decisions_for(enriched, processing_snapshot)
+    decisions = decisions_for(enriched, processing_snapshot, now_ms)
     outcomes = apply_decisions(run_id, enriched, decisions, now_ms)
     @helper.finish(run_id: run_id, now_ms: now_ms, window_start_ms: window_start_ms)
     applied_ids = outcomes.reject { |outcome| outcome["action"] == "deferred" }.map { |outcome| outcome["id"] }
@@ -161,19 +167,24 @@ class TitleEventWorker
   end
 
   def daemon_loop
-    last_result = { "status" => "finished", "reason" => "business_hours_closed" }
+    last_result = { "status" => "finished", "reason" => "daemon_started" }
     loop do
       current_time = @now.call
-      break unless TitleEventMaintenance::BusinessHours.open?(current_time)
-
-      @wake_requested = false
       last_result = run_locked(current_time, force_reconcile: false, dry_run: false)
       sleep_seconds = next_wake_seconds(@now.call)
-      break if sleep_seconds <= 0
-
-      sleep(sleep_seconds)
+      wait_for_wake(sleep_seconds)
     end
     last_result
+  end
+
+  def wait_for_wake(seconds)
+    return sleep(seconds) unless @wake_reader
+    return unless IO.select([@wake_reader], nil, nil, seconds)
+
+    loop do
+      chunk = @wake_reader.read_nonblock(4_096, exception: false)
+      break if chunk == :wait_readable || chunk.nil?
+    end
   end
 
   def next_wake_seconds(current_time)
@@ -186,14 +197,7 @@ class TitleEventWorker
     queue_wait = @store.seconds_until_next(now_ms: now_ms, idle_ms: IDLE_MS)
     waits << queue_wait if queue_wait
     waits << [((integer(state["last_pr_poll_ms"]) + PR_POLL_MS - now_ms) / 1000.0), 1].max
-    waits << seconds_until_business_close(current_time)
     [waits.min || 60, 1].max
-  end
-
-  def seconds_until_business_close(current_time)
-    local = current_time.getlocal(TitleEventMaintenance::BusinessHours::UTC_OFFSET)
-    close_time = Time.new(local.year, local.month, local.day, 18, 1, 0, TitleEventMaintenance::BusinessHours::UTC_OFFSET)
-    [close_time - local, 0].max
   end
 
   def ensure_retryable_snapshot(snapshot, candidates, now_ms)
@@ -204,7 +208,7 @@ class TitleEventWorker
       @store.enqueue(candidate["id"], source: "reconcile", now_ms: now_ms, force: true)
     end
     current = @store.snapshot(now_ms: now_ms, idle_ms: 0)
-    candidates.each_with_object({}) do |candidate, result|
+    candidates.each_with_object(combined) do |candidate, result|
       entry = current[candidate["id"]] || combined[candidate["id"]]
       result[candidate["id"]] = entry if entry
     end
@@ -232,7 +236,7 @@ class TitleEventWorker
 
     client = @app_client_factory.call
     client.connect
-    candidates.filter_map do |candidate|
+    candidates.each_with_object([]) do |candidate, result|
       live = client.read_thread(candidate["id"])
       live_title = live["name"].to_s.strip
       if live_title.empty?
@@ -240,7 +244,7 @@ class TitleEventWorker
         next
       end
 
-      candidate.merge(
+      result << candidate.merge(
         "title" => live_title,
         "live_version" => live_thread_version(live)
       )
@@ -249,7 +253,7 @@ class TitleEventWorker
     client.close if client
   end
 
-  def decisions_for(candidates, snapshot)
+  def decisions_for(candidates, snapshot, now_ms)
     deterministic = []
     semantic = []
     candidates.each do |candidate|
@@ -257,9 +261,26 @@ class TitleEventWorker
       decision ? deterministic << decision : semantic << candidate
     end
 
-    semantic_decisions = semantic.each_slice(MODEL_BATCH_SIZE).flat_map { |batch| @decider.decide(batch) }
+    semantic_decisions = semantic.each_slice(MODEL_BATCH_SIZE).flat_map do |batch|
+      resilient_semantic_decisions(batch, now_ms)
+    end
     by_id = (deterministic + semantic_decisions).each_with_object({}) { |decision, result| result[decision["id"]] = decision }
     candidates.map { |candidate| by_id.fetch(candidate["id"]) }
+  end
+
+  def resilient_semantic_decisions(batch, now_ms)
+    @decider.decide(batch)
+  rescue TitleModelDecider::InvalidDecisionError => error
+    if batch.length > 1
+      midpoint = batch.length / 2
+      return resilient_semantic_decisions(batch.first(midpoint), now_ms) +
+        resilient_semantic_decisions(batch.drop(midpoint), now_ms)
+    end
+
+    candidate = batch.first
+    warn "Terra decision deferred #{candidate['id']}: #{error.message}"
+    @store.defer_until_idle(candidate["id"], source: "invalid-model-decision", now_ms: now_ms)
+    [{ "id" => candidate["id"], "action" => "deferred", "title" => nil, "reason" => error.message }]
   end
 
   def deterministic_pr_decision(candidate, event_entry)
@@ -287,6 +308,8 @@ class TitleEventWorker
 
     decisions.map do |decision|
       candidate = candidate_by_id.fetch(decision["id"])
+      next decision if decision["action"] == "deferred"
+
       live = client.read_thread(candidate["id"])
       unless live_thread_version(live) == candidate["live_version"]
         @store.defer_until_idle(candidate["id"], source: "changed-during-decision", now_ms: now_ms)

@@ -11,6 +11,7 @@ require "shellwords"
 require "timeout"
 require_relative "codex_app_server_client"
 require_relative "title_event_store"
+require_relative "title_event_worker"
 require_relative "title_model_decider"
 require_relative "title_pr_resolver"
 
@@ -97,9 +98,9 @@ class TitleEventInstaller
       "hook" => hook_report,
       "launch_agent" => launch_report,
       "schedule" => {
-        "business_timezone" => "Asia/Shanghai (+08:00)",
-        "business_hours" => "weekdays 09:00-18:00",
-        "local_start" => local_schedule_label
+        "event_processing" => "always_on",
+        "pr_poll_seconds" => TitleEventWorker::PR_POLL_MS / 1000,
+        "reconciliation" => "once_per_beijing_calendar_day"
       },
       "binaries" => binaries,
       "queue_size" => store.queue_size,
@@ -214,12 +215,6 @@ class TitleEventInstaller
     "hooks.state.#{JSON.generate(hook_key)}.trusted_hash"
   end
 
-  def self.local_start(now = Time.now)
-    beijing_monday = Time.new(2026, 8, 24, 9, 0, 0, "+08:00")
-    local = beijing_monday.getlocal(now.utc_offset)
-    { "Hour" => local.hour, "Minute" => local.min, "Weekday" => local.wday }
-  end
-
   private
 
   def validate_installation_inputs!
@@ -326,8 +321,6 @@ class TitleEventInstaller
     if (owner = ENV["CODEX_TITLE_OWNER_ID"]) && !owner.empty?
       env["CODEX_TITLE_OWNER_ID"] = owner
     end
-    calendar = weekday_calendar
-
     <<~PLIST
       <?xml version="1.0" encoding="UTF-8"?>
       <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -348,10 +341,6 @@ class TitleEventInstaller
         </dict>
         <key>RunAtLoad</key>
         <true/>
-        <key>StartCalendarInterval</key>
-        <array>
-      #{calendar.map { |entry| "    <dict>\n      <key>Hour</key><integer>#{entry['Hour']}</integer>\n      <key>Minute</key><integer>#{entry['Minute']}</integer>\n      <key>Weekday</key><integer>#{entry['Weekday']}</integer>\n    </dict>" }.join("\n")}
-        </array>
         <key>KeepAlive</key>
         <dict>
           <key>SuccessfulExit</key>
@@ -370,23 +359,6 @@ class TitleEventInstaller
       </dict>
       </plist>
     PLIST
-  end
-
-  def weekday_calendar
-    first = self.class.local_start(@now.call)
-    (1..5).map do |beijing_wday|
-      delta = beijing_wday - 1
-      {
-        "Hour" => first["Hour"],
-        "Minute" => first["Minute"],
-        "Weekday" => (first["Weekday"] + delta) % 7
-      }
-    end
-  end
-
-  def local_schedule_label
-    first = self.class.local_start(@now.call)
-    format("weekdays %02d:%02d (UTC%+03d:%02d)", first["Hour"], first["Minute"], @now.call.utc_offset / 3600, (@now.call.utc_offset.abs % 3600) / 60)
   end
 
   def ensure_launch_agent(plist_changed:)
