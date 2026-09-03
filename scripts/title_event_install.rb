@@ -17,6 +17,7 @@ require_relative "title_pr_resolver"
 
 class TitleEventInstaller
   DEFAULT_LABEL = "local.codex-session-title-maintenance"
+  LEGACY_LAUNCH_AGENT_LABELS = %w[com.pengx17.codex-title-maintenance].freeze
   HOOK_TIMEOUT_SECONDS = 5
   CANARY_TIMEOUT_SECONDS = 120
   HOOK_EVENTS = %w[SessionStart UserPromptSubmit Stop].freeze
@@ -59,6 +60,7 @@ class TitleEventInstaller
   def install(run_canary: false)
     validate_installation_inputs!
     FileUtils.mkdir_p(@runtime_root, mode: 0o700)
+    retired_launch_agents = retire_legacy_launch_agents
     hook_changed = write_hook_config
     trust = trust_hook
     plist_changed = write_launch_agent
@@ -72,6 +74,7 @@ class TitleEventInstaller
       "hook_config_changed" => hook_changed,
       "hook_trust" => trust,
       "launch_agent_changed" => plist_changed,
+      "retired_launch_agents" => retired_launch_agents,
       "canary" => canary,
       "health" => health
     }
@@ -221,6 +224,47 @@ class TitleEventInstaller
   end
 
   private
+
+  def retire_legacy_launch_agents
+    domain = "gui/#{Process.uid}"
+    LEGACY_LAUNCH_AGENT_LABELS.each_with_object([]) do |legacy_label, retired|
+      next if legacy_label == @label
+
+      plist_path = File.join(@home, "Library", "LaunchAgents", "#{legacy_label}.plist")
+      stdout, _stderr, loaded = Open3.capture3("/bin/launchctl", "print", "#{domain}/#{legacy_label}")
+      pid = stdout[/^\s*pid = (\d+)\s*$/, 1]
+      if loaded.success?
+        _bootout_stdout, bootout_stderr, bootout = Open3.capture3(
+          "/bin/launchctl", "bootout", "#{domain}/#{legacy_label}"
+        )
+        raise "failed to retire legacy LaunchAgent #{legacy_label}: #{bootout_stderr.strip}" unless bootout.success?
+
+        wait_for_process_exit(pid.to_i) if pid
+      end
+      next unless File.file?(plist_path)
+
+      retired_path = "#{plist_path}.retired"
+      retired_path = "#{retired_path}.#{@now.call.utc.strftime('%Y%m%dT%H%M%SZ')}" if File.exist?(retired_path)
+      File.rename(plist_path, retired_path)
+      retired << { "label" => legacy_label, "plist" => retired_path }
+    end
+  end
+
+  def wait_for_process_exit(pid)
+    50.times do
+      return unless process_alive?(pid)
+
+      sleep 0.1
+    end
+    raise "legacy title-maintenance worker #{pid} did not exit after launchctl bootout"
+  end
+
+  def process_alive?(pid)
+    Process.kill(0, pid)
+    true
+  rescue Errno::ESRCH
+    false
+  end
 
   def validate_installation_inputs!
     missing = [@hook_script, @worker_script].reject { |path| File.file?(path) }

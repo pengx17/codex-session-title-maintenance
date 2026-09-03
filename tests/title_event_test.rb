@@ -178,6 +178,28 @@ class TitleEventInstallerTest < Minitest::Test
     refute_includes plist, "StartCalendarInterval"
   end
 
+  def test_install_retires_the_old_launch_agent_plist
+    Dir.mktmpdir do |home|
+      launch_agents = File.join(home, "Library", "LaunchAgents")
+      FileUtils.mkdir_p(launch_agents)
+      legacy_path = File.join(launch_agents, "com.pengx17.codex-title-maintenance.plist")
+      File.write(legacy_path, "legacy")
+      installer = TitleEventInstaller.allocate
+      installer.instance_variable_set(:@home, home)
+      installer.instance_variable_set(:@label, TitleEventInstaller::DEFAULT_LABEL)
+      installer.instance_variable_set(:@now, -> { Time.utc(2026, 9, 3) })
+      unavailable = Object.new
+      unavailable.define_singleton_method(:success?) { false }
+      Open3.stub(:capture3, ["", "", unavailable]) do
+        retired = installer.send(:retire_legacy_launch_agents)
+
+        assert_equal ["com.pengx17.codex-title-maintenance"], retired.map { |item| item["label"] }
+        refute File.exist?(legacy_path)
+        assert File.exist?("#{legacy_path}.retired")
+      end
+    end
+  end
+
 end
 
 class CodexAppServerClientTest < Minitest::Test
@@ -380,6 +402,24 @@ class TitleEventWorkerReconciliationTest < Minitest::Test
 
       refute worker.send(:startup_warmup_due?, current_time)
     end
+  end
+
+  def test_active_maintenance_lock_is_skipped_without_fetching_a_run_id
+    helper = Class.new do
+      def prepare(**_options)
+        { "status" => "skipped", "reason" => "active_lock" }
+      end
+    end.new
+    worker = TitleEventWorker.new(
+      store: FakeStore.new,
+      helper: helper,
+      now: -> { Time.new(2026, 8, 24, 10, 0, 0, "+08:00") }
+    )
+
+    result = worker.run(dry_run: true)
+
+    assert_equal "skipped", result["status"]
+    assert_equal "active_lock", result["reason"]
   end
 
   def test_retryable_snapshot_keeps_due_events_that_no_longer_produce_candidates
