@@ -296,6 +296,7 @@ class TitleMaintenance
     originator = nil
     first_user_message = nil
     recent_messages = []
+    mainline_messages = []
     signature_user_texts = []
     File.foreach(path) do |line|
       item = JSON.parse(line)
@@ -310,6 +311,7 @@ class TitleMaintenance
           message = { "role" => payload["role"], "text" => text[0, CONTEXT_MESSAGE_CHARS] }
           if payload["role"] == "user"
             first_user_message ||= message
+            mainline_messages << message if mainline_messages.length < 3
             signature_user_texts << message["text"] if signature_user_texts.length < 3
           end
           recent_messages << message
@@ -325,6 +327,8 @@ class TitleMaintenance
       "repository_url" => repository_url,
       "originator" => originator,
       "messages" => [first_user_message, *recent_messages].compact.uniq,
+      "mainline_messages" => mainline_messages,
+      "recent_messages" => recent_messages,
       "automation_run" => signature.include?("Automation ID: codex-session") || signature.include?(AUTOMATION_TITLE)
     }
   end
@@ -349,6 +353,7 @@ class TitleMaintenance
     return false if stripped.empty?
 
     ignored_prefixes = [
+      "<heartbeat>",
       "<recommended_plugins>",
       "# AGENTS.md instructions",
       "<environment_context>",

@@ -100,7 +100,8 @@ class TitleModelDecider
         "id" => candidate["id"],
         "currentTitle" => candidate["title"],
         "cwd" => candidate.dig("context", "cwd"),
-        "messages" => Array(candidate.dig("context", "messages")),
+        "mainlineMessages" => Array(candidate.dig("context", "mainline_messages")),
+        "recentMessages" => Array(candidate.dig("context", "recent_messages") || candidate.dig("context", "messages")),
         "eventSources" => Array(candidate["event_sources"]),
         "threadStatus" => candidate.dig("live_version", "status"),
         "pullRequests" => Array(candidate["pull_requests"]).map do |pr|
@@ -113,8 +114,12 @@ class TitleModelDecider
 
       标题格式：状态 emoji + 可选稳定标签 + 简洁中文主题。状态 emoji 必须是首字符，并且标题中不得再有装饰 emoji。
       状态仅用：🔄 实现中或 Draft；🟡 open 非 Draft、CI、review 或 merge-ready；⚠️ 明确 blocker 或失败门禁；⏸️ 等待外部、用户或验收；✅ 已完成或 merged；⛔ closed 未合并；⏱️ 周期巡检。
-      idle 不等于完成。实时 pullRequests metadata 高于历史对话；其 statusEmoji 应作为 PR session 的首字符。
-      eventSources 包含 user-prompt 且不包含 stop 时，这是长任务开始后的快速标题阶段：标题应反映最新用户目标，非 PR 标题只能使用 🔄，不得宣称完成或等待。后续 stop 事件会用完整结果校正状态。
+      主题与状态分开判断。mainlineMessages 是早期主线锚点，recentMessages 是近期进展，不是每轮都重起主题。
+      标题概括整个任务的主线，而非最后一个问题、排障步骤、单次提交或部署动作。普通追问和实现细节沿用主线；只有用户明确切换目标，或持续的新方向确实取代旧主线，才改变主题。当前标题也可能已被带偏，要对照主线纠正，不能盲目保留。
+      例如：主线是 Codex 自动标题维护，近期修 LaunchAgent 或讨论模型，主题仍是“Codex 自动标题维护”，不要变成“修复 LaunchAgent 升级冲突”。
+      idle 不等于完成，✅ 也不是不可逆状态。新追问、重开工作要重新判断当前状态，不要继承历史完成结论。
+      pullRequests metadata 是 PR 自身状态的权威证据，但历史 PR merged 不等于整个会话完成。仅当当前任务仍是该 PR 的交付时，才用其 statusEmoji；后续追问、修复、扩展按当前会话状态判断。
+      eventSources 包含 user-prompt 且不包含 stop，且 threadStatus 为 active 时，这是快速阶段：保持稳定主线，用 🔄 表示正在处理本轮，不得因历史 merged 保留 ✅。后续 stop 根据本轮结果重新判断状态。
       只有当前标题过泛、失真、缺少关键项目/PR/主题或状态变化时才 rename，否则 keep。
       保留稳定项目标签，例如 [Project]、[Project PR #123]。主题尽量使用中文；专有名词、PR 编号和 RFC 名称可保留英文。
       每个输入 id 必须且只能返回一个 decision。keep 的 title 必须为 null；rename 的 title 必须是完整新标题。

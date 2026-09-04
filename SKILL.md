@@ -16,7 +16,7 @@ SessionStart/UserPromptSubmit/Stop hooks -> durable queue -> launchd worker -> v
 ```
 
 - `title_event_hook.rb` captures task start, new user goals, and completed turns without blocking or failing the Codex session.
-- Codex owns the initial task title. A user prompt starts a fast provisional pass after 20 seconds so long-running tasks do not keep a stale title; non-PR provisional titles remain `🔄`. A Stop event schedules a final pass after 90 seconds so completed context and status can correct the title.
+- Codex owns the initial task title. A user prompt starts a conditional pass after 20 seconds. Keep an accurate mainline topic; a demonstrably active new turn can reopen a completed title as `🔄`, including follow-ups after a PR merged. A Stop event schedules a final pass after 90 seconds. New lifecycle events supersede the previous turn's lifecycle phase and deadline.
 - `title_event_worker.rb --daemon` is always on and batches semantic decisions. Events are processed regardless of weekday or clock time.
 - Explicit lifecycle/PR events bypass the stale `session_index.jsonl` timestamp filter after their debounce. Before deciding, read the live Codex title/version; immediately before writing, read it again. A provisional active-task decision may tolerate timestamp-only progress, but any title change still discards the stale decision. Final decisions also require the task status and version to remain unchanged.
 - Poll only already-tracked open PR metadata every ten minutes. PR status-class changes are deterministic and do not invoke a model. Use `gpt-5.6-terra` at `high` only for semantic title decisions.
@@ -59,9 +59,9 @@ Format: `<status emoji> [optional stable tag] concise Chinese topic`.
 - `⛔` closed without merge
 - `⏱️` scheduled monitoring
 
-The status emoji must be first and the only decorative emoji. Preserve useful tags such as `[Project]` or `[Project PR #123]`. Rename only for a generic/inaccurate title, a missing key topic/tag, or a changed status. Idle does not mean complete.
+The status emoji must be first and the only decorative emoji. Preserve useful tags such as `[Project]` or `[Project PR #123]`. Separate the stable mainline topic from the current status. Use early user context as a mainline anchor and recent messages for progress; do not replace the topic with each debugging step or follow-up. Explicit goal changes or a sustained replacement direction may change the mainline. Rename only for a generic/inaccurate title, a missing key topic/tag, or a changed status. Idle does not mean complete; completion is not irreversible.
 
-If a candidate contains a PR number/URL or clearly concerns a PR, query live GitHub metadata first. The current PR state overrides historical context.
+If a candidate contains a PR number/URL or clearly concerns a PR, query live GitHub metadata first. It is authoritative for that PR, not proof that the whole conversation is complete after subsequent user follow-ups.
 
 ## Record safely
 

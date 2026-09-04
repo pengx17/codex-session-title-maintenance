@@ -645,6 +645,7 @@ class TitleEventWorkerConcurrencyTest < Minitest::Test
     candidate = {
       "id" => THREAD_ID,
       "event_sources" => ["user-prompt"],
+      "live_version" => { "status" => { "type" => "active" } },
       "pull_requests" => []
     }
     decision = { "id" => THREAD_ID, "action" => "rename", "title" => "✅ 完成迁移" }

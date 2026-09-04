@@ -23,7 +23,7 @@ Codex still owns the initial title. This tool is a delayed second pass:
 
 1. Codex creates its native task title.
 2. `SessionStart` and `UserPromptSubmit` hooks capture new or resumed goals without blocking the task.
-3. After 20 seconds, a fast provisional pass can update a long-running non-PR task with a `🔄` title while it is still active.
+3. After 20 seconds, a conditional pass preserves the mainline topic and can reopen the status as `🔄` while the new turn is active, even after an earlier PR merged. An accurate title need not change.
 4. A `Stop` hook schedules a final pass after a 90-second quiet window so complete context and status can correct the title.
 5. The worker reads the live title and task version before deciding, then checks them again immediately before writing. A manual/native title change invalidates the stale decision.
 
@@ -76,6 +76,8 @@ INSTALLER="${CODEX_HOME:-$HOME/.codex}/skills/codex-session-title-maintenance/sc
 
 ## Behavior
 
+Topic and status are separate: early user messages anchor the mainline, while recent messages describe progress. Follow-up questions, debugging steps, and individual deployments should not replace the overall topic. Explicit goal changes can. A completed status is reversible when work resumes; historical merged PRs do not freeze the whole conversation as done.
+
 - always-on lifecycle-event processing with no working-hours restriction
 - 20-second provisional title pass after a new user goal
 - 90-second final title pass after Stop
@@ -92,6 +94,7 @@ Optional environment variables include `CODEX_TITLE_MODEL`, `CODEX_TITLE_REASONI
 ```bash
 ruby tests/title_event_test.rb
 ruby tests/title_maintenance_test.rb
+ruby tests/title_mainline_test.rb
 ```
 
 The tests cover event-specific debounce/retry, lifecycle-hook capture, startup and Beijing-day reconciliation, active-task title updates, app-server transport, PR status mapping, stale-index recovery, and the native/manual-title concurrency guard.

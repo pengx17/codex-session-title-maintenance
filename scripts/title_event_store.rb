@@ -68,14 +68,21 @@ module TitleEventMaintenance
         queue = load_json(@queue_path, empty_queue)
         queue["revision"] = integer(queue["revision"]) + 1
         current = queue.fetch("threads", {})[thread_id] || {}
+        # A new turn supersedes the previous turn's Stop/debounce, but keeps PR events.
+        lifecycle = %w[session-start user-prompt stop].include?(source.to_s)
+        if lifecycle && Integer(now_ms) < integer(current["queued_at_ms"])
+          return deep_copy(current)
+        end
+        sources = Array(current["sources"])
+        sources -= %w[session-start user-prompt stop] if lifecycle
         not_before_ms = delay_ms.nil? ? integer(current["not_before_ms"]) : Integer(now_ms) + Integer(delay_ms)
         queue["threads"] ||= {}
         queue["threads"][thread_id] = {
           "queued_at_ms" => [integer(current["queued_at_ms"]), Integer(now_ms)].max,
           "revision" => queue["revision"],
-          "sources" => (Array(current["sources"]) + [source.to_s]).uniq.sort,
-          "force" => !!current["force"] || !!force,
-          "not_before_ms" => [integer(current["not_before_ms"]), not_before_ms].max,
+          "sources" => (sources + [source.to_s]).uniq.sort,
+          "force" => lifecycle ? !!force : !!current["force"] || !!force,
+          "not_before_ms" => lifecycle ? not_before_ms : [integer(current["not_before_ms"]), not_before_ms].max,
           "attempts" => 0,
           "next_retry_at_ms" => 0,
           "last_error" => nil

@@ -281,14 +281,16 @@ class TitleEventWorker
     candidates_by_id = candidates.each_with_object({}) { |candidate, result| result[candidate["id"]] = candidate }
     decisions.map do |decision|
       candidate = candidates_by_id.fetch(decision["id"])
-      sources = Array(candidate["event_sources"])
-      provisional = sources.include?("user-prompt") && (sources & %w[stop pr-status pr-content]).empty?
-      next decision unless provisional && Array(candidate["pull_requests"]).empty? && decision["action"] == "rename"
+      next decision unless provisional_candidate?(candidate)
+      next decision unless %w[keep rename].include?(decision["action"])
+      # A keep decision can preserve the topic, but cannot freeze a terminal status
+      # while a fresh user turn is demonstrably active (even after a PR merged).
+      title = decision["action"] == "keep" ? candidate["title"] : decision["title"]
 
-      current_status = TitleModelDecider::STATUS_EMOJIS.find { |emoji| decision["title"].to_s.start_with?(emoji) }
+      current_status = TitleModelDecider::STATUS_EMOJIS.find { |emoji| title.to_s.start_with?(emoji) }
       next decision unless current_status && current_status != "🔄"
 
-      decision.merge("title" => "🔄#{decision['title'][current_status.length..-1]}")
+      decision.merge("action" => "rename", "title" => "🔄#{title[current_status.length..-1]}")
     end
   end
 
@@ -388,7 +390,8 @@ class TitleEventWorker
 
   def provisional_candidate?(candidate)
     sources = Array(candidate["event_sources"])
-    sources.include?("user-prompt") && (sources & %w[stop pr-status pr-content]).empty? && Array(candidate["pull_requests"]).empty?
+    sources.include?("user-prompt") && !sources.include?("stop") &&
+      thread_status_type(candidate.dig("live_version", "status")) == "active"
   end
 
   def thread_status_type(status)
