@@ -275,7 +275,29 @@ class TitleEventWorker
     end
     by_id = (deterministic + semantic_decisions).each_with_object({}) { |decision, result| result[decision["id"]] = decision }
     decisions = candidates.map { |candidate| by_id.fetch(candidate["id"]) }
-    normalize_provisional_decisions(candidates, decisions)
+    normalize_completion_decisions(candidates, normalize_provisional_decisions(candidates, decisions))
+  end
+
+  def normalize_completion_decisions(candidates, decisions)
+    by_id = candidates.each_with_object({}) { |candidate, index| index[candidate["id"]] = candidate }
+    decisions.map do |decision|
+      next decision unless %w[keep rename].include?(decision["action"])
+      candidate = by_id.fetch(decision["id"])
+      title = decision["action"] == "keep" ? candidate["title"] : decision["title"]
+      next decision unless title.to_s.start_with?("✅")
+
+      open_prs = Array(candidate["pull_requests"]).select { |pr| pr["state"].to_s.upcase == "OPEN" }
+      status = aggregate_pr_status(open_prs) unless open_prs.empty?
+      status ||= "🟡" unless open_prs.empty?
+      messages = Array(candidate.dig("context", "recent_messages") || candidate.dig("context", "messages"))
+      latest = messages.reverse.find { |message| message["role"] == "assistant" }
+      pending = latest && latest["text"].to_s.match?(/未(?:做|完成|进行)?(?:线上|真实|产品)?验收|未部署|待验收|等待.{0,12}验收|验收(?:尚未|未完成|未通过)|not (?:yet )?(?:deployed|validated)|acceptance (?:pending|incomplete)/i)
+      status ||= "⏸️" if pending
+      next decision unless status
+
+      decision.merge("action" => "rename", "title" => status + title[1..-1],
+                     "reason" => "Open PR or explicit pending delivery prevents task completion")
+    end
   end
 
   def normalize_provisional_decisions(candidates, decisions)
@@ -313,6 +335,8 @@ class TitleEventWorker
     return nil if sources.empty? || sources.any? { |source| source != "pr-status" }
     status = aggregate_pr_status(candidate["pull_requests"])
     return nil unless status
+    # A merged PR alone cannot establish deployment or product acceptance.
+    return nil if status == "✅"
     return nil unless @decider.valid_title?(candidate["title"])
 
     current_status = TitleModelDecider::STATUS_EMOJIS.find { |emoji| candidate["title"].start_with?(emoji) }

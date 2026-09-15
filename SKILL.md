@@ -57,7 +57,7 @@ Format: `<status emoji> [optional stable tag] concise Chinese topic`.
 - `🟡` open non-Draft PR / CI / review / merge-ready
 - `⚠️` confirmed blocker or failed gate
 - `⏸️` waiting for a person, external system, or acceptance
-- `✅` completed or merged
+- `✅` whole task completed with evidence for all required delivery and acceptance; merge alone is insufficient
 - `⛔` closed without merge
 - `⏱️` scheduled monitoring
 

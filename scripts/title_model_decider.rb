@@ -112,9 +112,10 @@ class TitleModelDecider
       维护 Codex session 标题。只根据下面提供的上下文返回结构化 decisions，不调用工具，也不要补充说明。
 
       标题格式：状态 emoji + 可选稳定标签 + 简洁中文主题。状态 emoji 必须是首字符，并且标题中不得再有装饰 emoji。
-      状态仅用：🔄 实现中或 Draft；🟡 open 非 Draft、CI、review 或 merge-ready；⚠️ 明确 blocker 或失败门禁；⏸️ 等待外部、用户或验收；✅ 已完成或 merged；⛔ closed 未合并；⏱️ 周期巡检。
+      状态仅用：🔄 实现中或 Draft；🟡 open 非 Draft、CI、review 或 merge-ready；⚠️ 明确 blocker 或失败门禁；⏸️ 等待外部、用户或验收；✅ 整个任务已完成且所有要求的交付和验收有明确证据；⛔ closed 未合并；⏱️ 周期巡检。
       idle 不等于完成。实时 pullRequests metadata 高于历史对话；其 statusEmoji 应作为 PR session 的首字符。
       eventSources 包含 user-prompt 且不包含 stop 时，这是长任务开始后的快速标题阶段：标题应反映最新用户目标，非 PR 标题只能使用 🔄，不得宣称完成或等待。后续 stop 事件会用完整结果校正状态。
+      PR 创建、CI 通过、merge-ready、merged、部署成功、单轮结束均不等于任务完成。有未合并 PR 用 🟡（Draft 用 🔄），已合并但未部署或未验收用 ⏸️；明确失败用 ⚠️。缺少完成证据禁止 ✅。即使当前标题已经是 ✅，也必须重新核对，不能用 keep 保留错误完成状态。
       只有当前标题过泛、失真、缺少关键项目/PR/主题或状态变化时才 rename，否则 keep。
       保留稳定项目标签，例如 [Project]、[Project PR #123]。主题尽量使用中文；专有名词、PR 编号和 RFC 名称可保留英文。
       每个输入 id 必须且只能返回一个 decision。keep 的 title 必须为 null；rename 的 title 必须是完整新标题。
