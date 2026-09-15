@@ -311,6 +311,7 @@ class TitleMaintenance
     first_user_message = nil
     recent_messages = []
     signature_user_texts = []
+    recent_user_messages = []
     File.foreach(path) do |line|
       item = JSON.parse(line)
       payload = item["payload"] || {}
@@ -320,10 +321,13 @@ class TitleMaintenance
         repository_url ||= payload.dig("git", "repository_url") if payload["git"].is_a?(Hash)
       elsif item["type"] == "response_item" && payload["type"] == "message" && %w[user assistant].include?(payload["role"])
         text = message_text(payload["content"])
+        text = text.gsub(/<in-app-browser-context\b[^>]*>.*?<\/in-app-browser-context>/m, "").strip if payload["role"] == "user"
         if meaningful_message?(text)
           message = { "role" => payload["role"], "text" => text[0, CONTEXT_MESSAGE_CHARS] }
           if payload["role"] == "user"
             first_user_message ||= message
+            recent_user_messages << message
+            recent_user_messages.shift while recent_user_messages.length > 20
             signature_user_texts << message["text"] if signature_user_texts.length < 3
           end
           recent_messages << message
@@ -339,6 +343,7 @@ class TitleMaintenance
       "repository_url" => repository_url,
       "originator" => originator,
       "messages" => [first_user_message, *recent_messages].compact.uniq,
+      "recent_user_messages" => recent_user_messages,
       "automation_run" => signature.include?("Automation ID: codex-session") || signature.include?(AUTOMATION_TITLE)
     }
   end
@@ -363,6 +368,7 @@ class TitleMaintenance
     return false if stripped.empty?
 
     ignored_prefixes = [
+      "<skill>",
       "<recommended_plugins>",
       "# AGENTS.md instructions",
       "<environment_context>",

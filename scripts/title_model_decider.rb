@@ -100,6 +100,7 @@ class TitleModelDecider
         "id" => candidate["id"],
         "currentTitle" => candidate["title"],
         "cwd" => candidate.dig("context", "cwd"),
+        "recentUserMessages" => Array(candidate.dig("context", "recent_user_messages")),
         "messages" => Array(candidate.dig("context", "messages")),
         "eventSources" => Array(candidate["event_sources"]),
         "threadStatus" => candidate.dig("live_version", "status"),
@@ -116,6 +117,7 @@ class TitleModelDecider
       idle 不等于完成。实时 pullRequests metadata 高于历史对话；其 statusEmoji 应作为 PR session 的首字符。
       eventSources 包含 user-prompt 且不包含 stop 时，这是长任务开始后的快速标题阶段：标题应反映最新用户目标，非 PR 标题只能使用 🔄，不得宣称完成或等待。后续 stop 事件会用完整结果校正状态。
       PR 创建、CI 通过、merge-ready、merged、部署成功、单轮结束均不等于任务完成。有未合并 PR 用 🟡（Draft 用 🔄），已合并但未部署或未验收用 ⏸️；明确失败用 ⚠️。缺少完成证据禁止 ✅。即使当前标题已经是 ✅，也必须重新核对，不能用 keep 保留错误完成状态。
+      recentUserMessages 按时间从旧到新保留近期用户需求。用户明确切换或持续推进的新目标优先于最早话题；mainlineMessages 只是历史起点，不是永久主题。结合当前 PR 的 title 验证最新目标，例如早期讨论 iMessage，后来持续开发微信且当前 PR 是 wechat，应保留微信主题，不得退回 iMessage 或作为参考提及的 Telegram。近期只说继续、review、merge 时，沿用最近一次有实质内容的用户目标。
       只有当前标题过泛、失真、缺少关键项目/PR/主题或状态变化时才 rename，否则 keep。
       保留稳定项目标签，例如 [Project]、[Project PR #123]。主题尽量使用中文；专有名词、PR 编号和 RFC 名称可保留英文。
       每个输入 id 必须且只能返回一个 decision。keep 的 title 必须为 null；rename 的 title 必须是完整新标题。
