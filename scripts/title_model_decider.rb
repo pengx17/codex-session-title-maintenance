@@ -16,8 +16,8 @@ class TitleModelDecider
   def self.default_codex
     candidates = [
       ENV["CODEX_TITLE_CODEX_BIN"],
-      File.expand_path("~/.vite-plus/bin/codex"),
       "/Applications/ChatGPT.app/Contents/Resources/codex",
+      File.expand_path("~/.vite-plus/bin/codex"),
       ENV.fetch("PATH", "").split(File::PATH_SEPARATOR).map { |dir| File.join(dir, "codex") }
     ].flatten.compact
     candidates.find { |path| File.file?(path) && File.executable?(path) } || "codex"

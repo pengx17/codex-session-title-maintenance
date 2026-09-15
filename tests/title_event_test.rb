@@ -176,6 +176,8 @@ class TitleEventInstallerTest < Minitest::Test
 
     assert_includes plist, "<key>RunAtLoad</key>"
     refute_includes plist, "StartCalendarInterval"
+    assert_match(/<key>ProcessType<\/key>\s*<string>Standard<\/string>/, plist)
+    refute_includes plist, "<key>LowPriorityIO</key>"
   end
 
   def test_install_retires_the_old_launch_agent_plist

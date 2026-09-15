@@ -412,9 +412,7 @@ class TitleEventInstaller
         <key>ThrottleInterval</key>
         <integer>30</integer>
         <key>ProcessType</key>
-        <string>Background</string>
-        <key>LowPriorityIO</key>
-        <true/>
+        <string>Standard</string>
         <key>StandardOutPath</key>
         <string>#{xml(File.join(@runtime_root, 'worker.log'))}</string>
         <key>StandardErrorPath</key>

@@ -21,6 +21,8 @@ SessionStart/UserPromptSubmit/Stop hooks -> durable queue -> launchd worker -> v
 - Explicit lifecycle/PR events bypass the stale `session_index.jsonl` timestamp filter after their debounce. Before deciding, read the live Codex title/version; immediately before writing, read it again. A provisional active-task decision may tolerate timestamp-only progress, but any title change still discards the stale decision. Final decisions also require the task status and version to remain unchanged.
 - Poll only already-tracked open PR metadata every ten minutes. PR status-class changes are deterministic and do not invoke a model. Use `gpt-5.6-terra` at `high` only for semantic title decisions.
 - Keep executables separate: use the configured CLI for Terra decisions, and the Desktop-bundled Codex binary for the short-lived writable app-server. Do not substitute an older standalone stdio app-server.
+- Default the decision CLI to the Desktop-bundled binary as well, while retaining separate overrides. An older standalone CLI can reject current configuration during the Stop canary.
+- Keep the LaunchAgent at Standard process priority without LowPriorityIO: background disk throttling can stall reads of session history on an external volume. Recover metadata locks whose owner PID has exited instead of waiting for the 55-minute fallback TTL.
 - On worker startup, reconcile recent and pinned threads as a loss-recovery warmup, with a 30-minute persisted cooldown to prevent crash-loop model churn. Also reconcile once per Beijing calendar day while the daemon remains alive; neither path is an hourly model scan.
 - A transient failure waits ten minutes. Notify through macOS only after the second consecutive failure; never create a Codex inbox item.
 

@@ -36,7 +36,7 @@ class TitleMaintenance
     end
 
     lock = load_json(@lock_path)
-    if lock && now_ms - integer(lock["started_at_ms"]) < LOCK_TTL_MS
+    if lock && now_ms - integer(lock["started_at_ms"]) < LOCK_TTL_MS && lock_owner_alive?(lock)
       return skipped("active_lock", "lock" => lock)
     end
 
@@ -232,6 +232,20 @@ class TitleMaintenance
     state["retry_pending"] = false unless state.key?("retry_pending")
     state["threads"] ||= {}
     state
+  end
+
+  # An interrupted worker can leave the metadata lock behind. Preserve the
+  # legacy TTL for unknown owners, but do not block on a process that exited.
+  def lock_owner_alive?(lock)
+    pid = integer(lock["pid"])
+    return true unless pid.positive?
+
+    Process.kill(0, pid)
+    true
+  rescue Errno::ESRCH
+    false
+  rescue Errno::EPERM
+    true
   end
 
   def write_yaml(state)

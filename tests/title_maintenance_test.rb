@@ -33,6 +33,22 @@ class TitleMaintenanceTest < Minitest::Test
     FileUtils.remove_entry(@dir)
   end
 
+  def test_prepare_recovers_recent_lock_owned_by_exited_process
+    write_index([entry("recent-id", NOW_MS - 1_000, "普通任务")])
+    pid = fork { exit! 0 }
+    Process.wait(pid)
+    File.write(@lock, JSON.generate("run_id" => "abandoned", "started_at_ms" => NOW_MS - 1_000, "pid" => pid))
+
+    result = @helper.prepare(now_ms: NOW_MS, dry_run: true)
+
+    assert_equal "ready", result["status"]
+  end
+
+  def test_prepare_preserves_recent_lock_owned_by_live_process
+    File.write(@lock, JSON.generate("run_id" => "active", "started_at_ms" => NOW_MS - 1_000, "pid" => Process.pid))
+    assert_equal "active_lock", @helper.prepare(now_ms: NOW_MS, dry_run: true)["reason"]
+  end
+
   def test_prepare_includes_recent_and_old_pinned_but_excludes_automation_and_owner
     write_index([
       entry("recent-id", NOW_MS - 1_000, "普通任务"),
