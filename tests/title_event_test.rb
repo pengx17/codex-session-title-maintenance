@@ -583,6 +583,106 @@ class TitleEventWorkerConcurrencyTest < Minitest::Test
     assert_equal [[THREAD_ID, "🔄 新目标"]], client.set_calls
   end
 
+  def test_unloaded_prompt_can_update_title_while_thread_timestamp_is_advancing
+    store = RecordingStore.new
+    helper = RecordingHelper.new
+    client = ChangingClient.new(
+      "name" => "旧目标",
+      "updatedAt" => 101,
+      "status" => { "type" => "notLoaded" }
+    )
+    worker = TitleEventWorker.new(
+      store: store,
+      helper: helper,
+      app_client_factory: -> { client }
+    )
+    candidate = {
+      "id" => THREAD_ID,
+      "title" => "旧目标",
+      "updated_at_ms" => 1_000,
+      "event_sources" => ["user-prompt"],
+      "pull_requests" => [],
+      "live_version" => {
+        "name" => "旧目标",
+        "updatedAt" => 100,
+        "status" => { "type" => "notLoaded" }
+      }
+    }
+    decision = { "id" => THREAD_ID, "action" => "rename", "title" => "🔄 新目标" }
+
+    outcomes = worker.send(:apply_decisions, "run-id", [candidate], [decision], 2_000)
+
+    assert_equal "rename", outcomes.first["action"]
+    assert_equal [[THREAD_ID, "🔄 新目标"]], client.set_calls
+  end
+
+  def test_unloaded_stop_still_rejects_timestamp_changes
+    store = RecordingStore.new
+    helper = RecordingHelper.new
+    client = ChangingClient.new(
+      "name" => "旧目标",
+      "updatedAt" => 101,
+      "status" => { "type" => "notLoaded" }
+    )
+    worker = TitleEventWorker.new(
+      store: store,
+      helper: helper,
+      app_client_factory: -> { client }
+    )
+    candidate = {
+      "id" => THREAD_ID,
+      "title" => "旧目标",
+      "updated_at_ms" => 1_000,
+      "event_sources" => ["stop"],
+      "pull_requests" => [],
+      "live_version" => {
+        "name" => "旧目标",
+        "updatedAt" => 100,
+        "status" => { "type" => "notLoaded" }
+      }
+    }
+    decision = { "id" => THREAD_ID, "action" => "rename", "title" => "🔄 新目标" }
+
+    outcomes = worker.send(:apply_decisions, "run-id", [candidate], [decision], 2_000)
+
+    assert_equal "deferred", outcomes.first["action"]
+    assert_empty client.set_calls
+  end
+
+  def test_new_event_invalidates_unloaded_prompt_decision
+    store = RecordingStore.new
+    def store.event_revision(_id); 2; end
+    helper = RecordingHelper.new
+    client = ChangingClient.new(
+      "name" => "旧目标",
+      "updatedAt" => 101,
+      "status" => { "type" => "notLoaded" }
+    )
+    worker = TitleEventWorker.new(
+      store: store,
+      helper: helper,
+      app_client_factory: -> { client }
+    )
+    candidate = {
+      "id" => THREAD_ID,
+      "title" => "旧目标",
+      "updated_at_ms" => 1_000,
+      "event_sources" => ["user-prompt"], "event_revision" => 1,
+      "pull_requests" => [],
+      "live_version" => {
+        "name" => "旧目标",
+        "updatedAt" => 100,
+        "status" => { "type" => "notLoaded" }
+      }
+    }
+    decision = { "id" => THREAD_ID, "action" => "rename", "title" => "🔄 新目标" }
+
+    outcomes = worker.send(:apply_decisions, "run-id", [candidate], [decision], 2_000)
+
+    assert_equal "deferred", outcomes.first["action"]
+    assert_empty client.set_calls
+  end
+
   def test_attach_live_versions_collects_named_threads_without_filter_map
     store = RecordingStore.new
     client = ChangingClient.new(

@@ -234,7 +234,8 @@ class TitleEventWorker
       metadata = refs.map { |ref| @resolver.fetch(ref) }
       candidate.merge(
         "pull_requests" => metadata,
-        "event_sources" => Array(snapshot.dig(candidate["id"], "sources"))
+        "event_sources" => Array(snapshot.dig(candidate["id"], "sources")),
+        "event_revision" => snapshot.dig(candidate["id"], "revision")
       )
     end
   end
@@ -378,6 +379,18 @@ class TitleEventWorker
   end
 
   def compatible_live_version?(candidate, live)
+    if candidate["event_revision"] && @store.event_revision(candidate["id"]) != candidate["event_revision"]
+      return false
+    end
+    # A separate app-server does not load the Desktop's active threads.
+    # Lifecycle events establish the provisional phase; notLoaded is not idle.
+    sources = Array(candidate["event_sources"])
+    original = candidate.fetch("live_version")
+    if !sources.include?("stop") && (sources & %w[user-prompt session-start]).any? &&
+        thread_status_type(original["status"]) == "notLoaded" &&
+        thread_status_type(live["status"]) == "notLoaded"
+      return live["name"].to_s == original["name"].to_s
+    end
     return live_thread_version(live) == candidate["live_version"] unless provisional_candidate?(candidate)
 
     original = candidate.fetch("live_version")

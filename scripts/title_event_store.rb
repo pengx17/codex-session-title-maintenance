@@ -111,6 +111,12 @@ module TitleEventMaintenance
       end
     end
 
+    def event_revision(thread_id)
+      with_lock(@queue_lock_path) do
+        load_json(@queue_path, empty_queue).dig("threads", thread_id, "revision")
+      end
+    end
+
     def snapshot(now_ms:, idle_ms:)
       with_lock(@queue_lock_path) do
         queue = load_json(@queue_path, empty_queue)
