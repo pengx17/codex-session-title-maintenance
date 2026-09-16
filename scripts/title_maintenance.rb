@@ -26,7 +26,7 @@ class TitleMaintenance
     @owner_id = paths.fetch(:owner_id, ENV["CODEX_TITLE_OWNER_ID"])
   end
 
-  def prepare(now_ms:, retry_slot: false, dry_run: false, thread_ids: nil, force_thread_ids: [], force_all: false, refresh_scope: false)
+  def prepare(now_ms:, retry_slot: false, dry_run: false, thread_ids: nil, force_thread_ids: [], force_all: false, refresh_scope: false, include_context: true)
     state = load_state
     if retry_slot
       primary_ms = now_ms - (now_ms % 3_600_000)
@@ -62,7 +62,7 @@ class TitleMaintenance
       next unless recent || pinned || forced
       next unless forced || refresh_scope || updated_at_ms > integer(threads.dig(id, "updated_at_ms"))
 
-      context = extract_context(rollouts[id])
+      context = include_context ? extract_context(rollouts[id]) : {}
       next if context["automation_run"]
 
       selected << {

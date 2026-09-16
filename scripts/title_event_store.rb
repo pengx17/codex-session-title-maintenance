@@ -68,14 +68,22 @@ module TitleEventMaintenance
         queue = load_json(@queue_path, empty_queue)
         queue["revision"] = integer(queue["revision"]) + 1
         current = queue.fetch("threads", {})[thread_id] || {}
+        # A new turn supersedes the previous turn's Stop/debounce, but keeps PR events.
+        lifecycle = %w[session-start user-prompt stop].include?(source.to_s)
+        queue["lifecycle"] ||= {}
+        previous_phase = queue["lifecycle"][thread_id]
+        return deep_copy(current) if lifecycle && previous_phase && Integer(now_ms) < previous_phase["at_ms"]
+        queue["lifecycle"][thread_id] = { "source" => source.to_s, "at_ms" => Integer(now_ms) } if lifecycle
+        sources = Array(current["sources"])
+        sources -= %w[session-start user-prompt stop] if lifecycle
         not_before_ms = delay_ms.nil? ? integer(current["not_before_ms"]) : Integer(now_ms) + Integer(delay_ms)
         queue["threads"] ||= {}
         queue["threads"][thread_id] = {
           "queued_at_ms" => [integer(current["queued_at_ms"]), Integer(now_ms)].max,
           "revision" => queue["revision"],
-          "sources" => (Array(current["sources"]) + [source.to_s]).uniq.sort,
-          "force" => !!current["force"] || !!force,
-          "not_before_ms" => [integer(current["not_before_ms"]), not_before_ms].max,
+          "sources" => (sources + [source.to_s]).uniq.sort,
+          "force" => lifecycle ? !!force : !!current["force"] || !!force,
+          "not_before_ms" => lifecycle ? not_before_ms : [integer(current["not_before_ms"]), not_before_ms].max,
           "attempts" => 0,
           "next_retry_at_ms" => 0,
           "last_error" => nil
@@ -111,7 +119,21 @@ module TitleEventMaintenance
       end
     end
 
+    def lifecycle(thread_id)
+      with_lock(@queue_lock_path) { deep_copy(load_json(@queue_path, empty_queue).dig("lifecycle", thread_id)) }
+    end
+
+    def health(now_ms: TitleEventMaintenance.now_ms)
+      with_lock(@queue_lock_path) do
+        entries = load_json(@queue_path, empty_queue).fetch("threads", {})
+        { "count" => entries.length,
+          "oldest_age_seconds" => entries.values.map { |e| (now_ms - integer(e["queued_at_ms"])) / 1000 }.max,
+          "errors" => entries.select { |_, e| e["last_error"] }.transform_values { |e| e.slice("last_error", "attempts", "next_retry_at_ms") } }
+      end
+    end
+
     def event_revision(thread_id)
+
       with_lock(@queue_lock_path) do
         load_json(@queue_path, empty_queue).dig("threads", thread_id, "revision")
       end
@@ -258,8 +280,9 @@ module TitleEventMaintenance
       return deep_copy(fallback) unless File.file?(path)
 
       parsed = JSON.parse(File.read(path))
-      parsed.is_a?(Hash) ? parsed : deep_copy(fallback)
-    rescue JSON::ParserError, Errno::ENOENT
+      raise "invalid state document: #{path}" unless parsed.is_a?(Hash)
+      parsed
+    rescue Errno::ENOENT
       deep_copy(fallback)
     end
 

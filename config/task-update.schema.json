@@ -1,0 +1,222 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "goal",
+    "requirements",
+    "pull_requests",
+    "progress"
+  ],
+  "properties": {
+    "goal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "action",
+        "topic",
+        "project",
+        "evidence"
+      ],
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": [
+            "retain",
+            "start",
+            "replace"
+          ]
+        },
+        "topic": {
+          "type": "string"
+        },
+        "project": {
+          "type": "string"
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "message_id",
+              "quote"
+            ],
+            "properties": {
+              "message_id": {
+                "type": "string"
+              },
+              "quote": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "requirements": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "description",
+          "kind",
+          "status",
+          "evidence"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "outcome",
+              "implementation",
+              "merge",
+              "deployment",
+              "acceptance",
+              "investigation",
+              "other"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "open",
+              "satisfied",
+              "waived"
+            ]
+          },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "message_id",
+                "quote"
+              ],
+              "properties": {
+                "message_id": {
+                  "type": "string"
+                },
+                "quote": {
+                  "type": "string"
+                }
+              }
+            },
+            "minItems": 1
+          }
+        }
+      }
+    },
+    "pull_requests": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "repo",
+          "number",
+          "relation",
+          "evidence"
+        ],
+        "properties": {
+          "repo": {
+            "type": "string"
+          },
+          "number": {
+            "type": "integer"
+          },
+          "relation": {
+            "type": "string",
+            "enum": [
+              "current",
+              "historical"
+            ]
+          },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "message_id",
+                "quote"
+              ],
+              "properties": {
+                "message_id": {
+                  "type": "string"
+                },
+                "quote": {
+                  "type": "string"
+                }
+              }
+            },
+            "minItems": 1
+          }
+        }
+      }
+    },
+    "progress": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "evidence",
+            "basis"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "working",
+                "waiting",
+                "blocked",
+                "monitoring",
+                "cancelled"
+              ]
+            },
+            "evidence": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "message_id",
+                  "quote"
+                ],
+                "properties": {
+                  "message_id": {
+                    "type": "string"
+                  },
+                  "quote": {
+                    "type": "string"
+                  }
+                }
+              },
+              "minItems": 1
+            },
+            "basis": {
+              "type": "string",
+              "enum": [
+                "task",
+                "pull_request"
+              ]
+            }
+          }
+        }
+      ]
+    }
+  }
+}

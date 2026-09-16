@@ -1,43 +1,55 @@
 ---
 name: codex-session-title-maintenance
-description: Maintain accurate, searchable Codex task titles from recent work, status emoji, PR lifecycle, and persisted timestamps. Use when reviewing, batch-renaming, or scheduling silent maintenance of Codex session titles.
+description: Maintain Codex task titles from durable goals, cited requirements, delivery evidence and live PR facts. Use when reviewing, batch-renaming, repairing or scheduling silent title maintenance.
 ---
 
 # Codex Session Title Maintenance
 
 Apply only to Codex tasks, never ChatGPT conversations.
 
-## Event-driven path
-
-The installed flow is:
+## State before title
 
 ```text
-SessionStart/UserPromptSubmit/Stop hooks -> durable queue -> launchd worker -> verified Codex title write
+lifecycle hooks -> durable queue -> ordered transcript deltas
+  -> cited task state + atomic cursor -> live PR facts
+  -> deterministic title -> verified app-server write -> exact-event ACK
 ```
 
-- `title_event_hook.rb` captures task start, new user goals, and completed turns without blocking or failing the Codex session.
-- Codex owns the initial task title. A user prompt starts a fast provisional pass after 20 seconds so long-running tasks do not keep a stale title; non-PR provisional titles remain `🔄`. A Stop event schedules a final pass after 90 seconds so completed context and status can correct the title.
-- `title_event_worker.rb --daemon` is always on and batches semantic decisions. Events are processed regardless of weekday or clock time.
-- Explicit lifecycle/PR events bypass the stale `session_index.jsonl` timestamp filter after their debounce. Before deciding, read the live Codex title/version; immediately before writing, read it again. A provisional active-task decision may tolerate timestamp-only progress, but any title change still discards the stale decision. Final decisions also require the task status and version to remain unchanged.
-- Poll only already-tracked open PR metadata every ten minutes. PR status-class changes are deterministic and do not invoke a model. Use `gpt-5.6-terra` at `high` only for semantic title decisions.
-- Keep executables separate: use the configured CLI for Terra decisions, and the Desktop-bundled Codex binary for the short-lived writable app-server. Do not substitute an older standalone stdio app-server.
-- Default the decision CLI to the Desktop-bundled binary as well, while retaining separate overrides. An older standalone CLI can reject current configuration during the Stop canary.
-- Keep the LaunchAgent at Standard process priority without LowPriorityIO: background disk throttling can stall reads of session history on an external volume. Recover metadata locks whose owner PID has exited instead of waiting for the 55-minute fallback TTL.
-- On worker startup, reconcile recent and pinned threads as a loss-recovery warmup, with a 30-minute persisted cooldown to prevent crash-loop model churn. Also reconcile once per Beijing calendar day while the daemon remains alive; neither path is an hourly model scan.
-- A transient failure waits ten minutes. Notify through macOS only after the second consecutive failure; never create a Codex inbox item.
+- Consume every meaningful user/assistant message in order, across bounded batches. Split long messages; never use first/last message windows as the source of truth.
+- Persist current goal, previous goals, outstanding requirements, resolutions, PR associations and progress. Omitted requirements remain open. Only evidenced user changes replace goals or waive requirements.
+- Use `gpt-5.6-terra` at `high` to extract cited changes. It never chooses the title or emoji. Validate message IDs, literal excerpts, immutable requirements and PR identities. Rejected changes do not advance the cursor.
+- Initial reconstruction publishes nothing until caught up. Legacy title timestamps are not transcript cursors. Per-task files under `~/.codex/title-maintenance/tasks-v1/` contain state, cursor, explanation and last applied title; `audit.jsonl` records transitions.
+- Completion requires the outcome and every applicable requirement satisfied, no current open/unmerged PR, fresh PR facts, a fully consumed source and no active turn. Merge never satisfies deployment or acceptance. Ongoing monitoring is not complete.
+- Poll current PR associations every ten minutes, including merged PRs whose task acceptance is still relevant. A PR poll rerenders stored state; unchanged transcripts require no model call. Failed provider reads are unknown.
 
-Core scripts:
+## Events and safe writes
 
-```text
-scripts/title_event_hook.rb
-scripts/title_event_worker.rb
-scripts/title_maintenance.rb
-scripts/title_event_install.rb
-```
+- Codex owns the initial native title. Hooks enqueue SessionStart, UserPromptSubmit and Stop without blocking or failing the task.
+- UserPromptSubmit debounce is 20 seconds; active turns display `🔄`. Stop debounce is 90 seconds. These are eligibility delays, not processing-time guarantees; initial reconstruction and model latency add time.
+- Persist lifecycle independently of queue ACK. Compare lifecycle timestamps with lifecycle timestamps, not PR-poll timestamps. `notLoaded` from a separate app-server is not proof of idle/completion.
+- Worker runs continuously, with startup reconciliation (30-minute cooldown) and daily Beijing-calendar reconciliation of recent/pinned tasks. Process one bounded batch per task and rotate retries so long histories do not monopolize the queue.
+- Before a title write, check the exact queue revision, current live title and new user input. Active provisional writes may tolerate assistant-only appends; ACK still requires all visible input consumed. Recheck after writing and retain concurrent events.
+- Use only app-server `thread/name/set`. Verify exact name through both app-server and index lookup before recording success. Never edit Codex databases, rollouts or `session_index.jsonl` directly.
+- Per-task failures retry after ten minutes without blocking other tasks. Repeated failures may notify through macOS, never a Codex inbox task. Corrupt files fail closed and remain available for diagnosis.
+- The API has no atomic compare-and-set for names: final read/write races are detected/requeued, not claimed impossible. Semantic extraction still needs replay validation.
 
-## Install, repair, or migrate
+## Status policy
 
-Always use the installer instead of hand-editing `hooks.json`, `config.toml`, or a LaunchAgent:
+Format: `<status emoji> [optional stable project/PR tag] concise Chinese topic`.
+
+- `🔄`: active turn, implementation, or draft PR
+- `🟡`: current non-draft PR remains open
+- `⚠️`: confirmed task blocker, failed gate, or current PR closed unmerged
+- `⏸️`: unknown provider state or waiting for outstanding delivery/acceptance
+- `✅`: all task requirements and outcome have completion evidence
+- `⛔`: user cancelled the goal
+- `⏱️`: ongoing monitoring
+
+The current goal determines the topic. Implementation steps, PR review and merge do not independently rewrite it. Historical/reference PRs do not control current status.
+
+## Install, repair and inspect
+
+Always use the installer instead of editing hooks, config or LaunchAgent manually:
 
 ```bash
 INSTALLER="${CODEX_HOME:-$HOME/.codex}/skills/codex-session-title-maintenance/scripts/title_event_install.rb"
@@ -45,31 +57,22 @@ INSTALLER="${CODEX_HOME:-$HOME/.codex}/skills/codex-session-title-maintenance/sc
 /usr/bin/ruby --disable=gems "$INSTALLER" doctor
 ```
 
-The installer is idempotent. It derives the current home and Codex directories, finds Apple Silicon or Intel Homebrew executables, preserves unrelated hooks, writes trust through Codex `config/batchWrite`, and safely reloads an always-on launchd worker. A successful install requires one enabled and trusted hook for each supported title event, a loaded valid LaunchAgent, a paused-or-absent legacy heartbeat, and a real Stop canary that verifies thread-id extraction and an isolated durable-queue write.
+The installer preserves unrelated hooks, writes trust through Codex `config/batchWrite`, reloads launchd and runs an isolated Stop-to-queue canary. `infrastructure_ok` verifies installation; `processing` reports reconstruction, queue age and task errors. An alive daemon or a canary alone does not establish semantic title correctness.
 
-To migrate, first verify the target's identity; never infer it from the nearest SSH alias. For a LAN Mac, resolve its Bonjour SSH service and confirm hostname, user, architecture, GUI launchd domain, and Codex home before copying anything. Then copy this entire skill directory into the target Mac's `$CODEX_HOME/skills/` and run the same `install --canary` command from that Mac's logged-in GUI user. Preflight Codex/app-server, `gh`, filesystem paths, network reachability, and existing host authentication before requesting any new login. Never copy source-machine absolute paths or trusted hashes; the target installer regenerates both.
+Keep a rollback copy before replacing installed scripts. Preserve the live queue and task checkpoints. New installations reconstruct historical tasks; never convert legacy title timestamps into consumed-message cursors.
 
-## Decide titles
+Read-only/shadow diagnostics:
 
-Format: `<status emoji> [optional stable tag] concise Chinese topic`.
+```bash
+ruby scripts/title_event_worker.rb --dry-run --force-reconcile
+ruby scripts/title_task_replay.rb --thread TASK_UUID --root /absolute/shadow-directory --batches 20
+ruby scripts/title_task_replay.rb --thread TASK_UUID --root /absolute/shadow-directory --inspect
+```
 
-- `🔄` implementation or Draft
-- `🟡` open non-Draft PR / CI / review / merge-ready
-- `⚠️` confirmed blocker or failed gate
-- `⏸️` waiting for a person, external system, or acceptance
-- `✅` whole task completed with evidence for all required delivery and acceptance; merge alone is insufficient
-- `⛔` closed without merge
-- `⏱️` scheduled monitoring
+Replay writes only its explicitly selected checkpoint directory, never task titles. Resume with the same root. Inspect shows goal/requirements/citations and pending work. Use a fresh shadow directory for independent semantic replay; do not silently reset production checkpoints. Changed/truncated source requires explicit reconstruction after preserving the old checkpoint.
 
-The status emoji must be first and the only decorative emoji. Preserve useful tags such as `[Project]` or `[Project PR #123]`. Rename only for a generic/inaccurate title, a missing key topic/tag, or a changed status. Idle does not mean complete.
+Use the Desktop-bundled Codex executable by default for both model calls and short-lived writable app-server, with separate overrides. Older standalone CLI versions may reject current configuration. Keep launchd at Standard priority without LowPriorityIO; external-volume transcripts can otherwise stall.
 
-If a candidate contains a PR number/URL or clearly concerns a PR, query live GitHub metadata first. The current PR state overrides historical context.
+For remote migration, verify hostname, user, architecture, GUI launchd domain and Codex home first. Copy the skill, preserve target-local pinned configuration, and run the installer as its GUI user. Never copy machine-specific trust hashes or absolute paths. Check actual executable, host authentication and network before requesting login.
 
-## Record safely
-
-- Kept: `record` the candidate's `updated_at_ms` with `disposition=kept`.
-- Renamed: use only Codex app-server `thread/name/set`; then `lookup --thread-id <id> --after-ms <old_ms> --timeout-ms 5000`, verify the exact title, and `record` the returned timestamp with `disposition=renamed`. Never place a generated title in a shell command.
-- After every candidate is recorded, call `finish` with the returned `run_id`, current time, and `window_start_ms`.
-- Do not archive, pin, delete, message, or otherwise mutate tasks.
-
-For manual recovery, run `title_event_worker.rb --force-reconcile`; use `--dry-run` first when diagnosing candidate selection. `--allow-outside-hours` remains a compatibility no-op for older commands. The legacy `title_maintenance.rb run` path remains available for diagnosis only. Use `CODEX_TITLE_OWNER_ID` only when a deployment has a specific owner task to exclude; never bake a source-machine task ID into portable code. Never call `list_threads`, create a duplicate automation, or reactivate the retired hourly heartbeat.
+Do not archive, pin, delete, message or otherwise mutate tasks. Do not call `list_threads`, create duplicate automations, or reactivate the retired hourly heartbeat. `CODEX_TITLE_OWNER_ID` is an optional deployment-local exclusion; never bake private task IDs into the repository. `--allow-outside-hours` remains a compatibility no-op. Legacy `title_maintenance.rb` context/record commands are diagnostic compatibility only, not the production decision path.

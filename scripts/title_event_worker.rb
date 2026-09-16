@@ -1,612 +1,231 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
-require "digest"
 require "json"
 require "optparse"
 require "open3"
+require "digest"
 require_relative "codex_app_server_client"
 require_relative "title_event_store"
 require_relative "title_maintenance"
-require_relative "title_model_decider"
-require_relative "title_pr_resolver"
+require_relative "title_task_engine"
 
 class TitleEventWorker
-  IDLE_MS = 90 * 1000
-  RETRY_MS = 10 * 60 * 1000
-  PR_POLL_MS = 10 * 60 * 1000
-  STARTUP_WARMUP_COOLDOWN_MS = 30 * 60 * 1000
-  PR_BOOTSTRAP_VERSION = 2
-  MODEL_BATCH_SIZE = 8
-  def initialize(
-    store: TitleEventMaintenance::Store.new,
-    helper: TitleMaintenance.new,
-    resolver: TitlePullRequestResolver.new,
-    decider: TitleModelDecider.new,
-    app_client_factory: -> { CodexAppServerClient.new },
-    now: -> { Time.now },
-    owner_thread_id: ENV["CODEX_TITLE_OWNER_ID"]
-  )
-    @store = store
-    @helper = helper
-    @resolver = resolver
-    @decider = decider
+  IDLE_MS = 90_000
+  RETRY_MS = 600_000
+  PR_POLL_MS = 600_000
+  STARTUP_WARMUP_COOLDOWN_MS = 1_800_000
+  PASS_LIMIT = 8
+
+  def initialize(store: TitleEventMaintenance::Store.new, helper: TitleMaintenance.new,
+                 engine: nil, app_client_factory: -> { CodexAppServerClient.new },
+                 now: -> { Time.now }, owner_thread_id: ENV["CODEX_TITLE_OWNER_ID"])
+    @store, @helper, @now, @owner_thread_id = store, helper, now, owner_thread_id
+    @engine = engine || TitleTaskEngine.new(store: TitleTaskStore.new(root: File.join(store.root, "tasks-v1")))
     @app_client_factory = app_client_factory
-    @now = now
-    @owner_thread_id = owner_thread_id
   end
 
   def run(allow_outside_hours: false, force_reconcile: false, dry_run: false)
-    current_time = @now.call
-    # Kept as a no-op keyword for compatibility with older recovery commands.
-    _allow_outside_hours = allow_outside_hours
-
     result = nil
-    locked = @store.with_worker_lock do
-      result = run_locked(current_time, force_reconcile: force_reconcile, dry_run: dry_run)
-    end
-    return { "status" => "skipped", "reason" => "worker_already_running" } unless locked
-
-    result
+    locked = @store.with_worker_lock { result = run_locked(force_reconcile: force_reconcile, dry_run: dry_run) }
+    locked ? result : { "status" => "skipped", "reason" => "worker_already_running" }
   end
 
   def run_daemon
-    result = nil
     locked = @store.with_worker_lock do
       @wake_reader, @wake_writer = IO.pipe
-      previous_handler = Signal.trap("USR1") do
-        @wake_writer.write_nonblock(".", exception: false)
-      rescue IOError, SystemCallError
-        nil
-      end
+      previous = Signal.trap("USR1") { @wake_writer.write_nonblock(".", exception: false) rescue nil }
       begin
-        result = daemon_loop
+        startup = millis - @store.read_state.fetch("last_startup_warmup_ms", 0).to_i >= STARTUP_WARMUP_COOLDOWN_MS
+        loop do
+          result = run_locked(force_reconcile: startup, dry_run: false)
+          if startup && result["status"] == "finished"
+            @store.update_state { |state| state["last_startup_warmup_ms"] = millis }
+            startup = false
+          end
+          puts JSON.generate(result) unless result["reason"] == "no_due_events"
+          $stdout.flush
+          wait_for_wake(result["status"] == "error" ? 60 : next_wake_seconds)
+        end
       ensure
-        Signal.trap("USR1", previous_handler)
-        @wake_reader.close unless @wake_reader.closed?
-        @wake_writer.close unless @wake_writer.closed?
+        Signal.trap("USR1", previous)
+        @wake_reader.close
+        @wake_writer.close
       end
     end
-    return { "status" => "skipped", "reason" => "worker_already_running" } unless locked
-
-    result
+    { "status" => "skipped", "reason" => locked ? "stopped" : "worker_already_running" }
   end
 
   private
 
-  def run_locked(current_time, force_reconcile:, dry_run:)
-    now_ms = (current_time.to_r * 1000).to_i
-    event_state = @store.read_state
-    retry_at_ms = integer(event_state["worker_retry_at_ms"])
-    if !dry_run && !force_reconcile && retry_at_ms > now_ms
-      return { "status" => "finished", "reason" => "retry_pending", "retry_at_ms" => retry_at_ms }
-    end
-
-    unless dry_run
-      bootstrap_ready = event_state["bootstrap_completed"] && integer(event_state["bootstrap_version"]) == PR_BOOTSTRAP_VERSION
-      bootstrap_pr_registry(now_ms) unless bootstrap_ready
-      poll_tracked_prs(now_ms)
-    end
-
-    date = TitleEventMaintenance::BeijingCalendar.date(current_time)
-    event_state = @store.read_state
-    reconcile = force_reconcile || event_state["last_reconcile_date"] != date
+  def run_locked(force_reconcile:, dry_run:)
+    now_ms = millis
+    date = TitleEventMaintenance::BeijingCalendar.date(@now.call)
+    state = @store.read_state
+    reconcile = force_reconcile || state["last_reconcile_date"] != date
     snapshot = @store.snapshot(now_ms: now_ms, idle_ms: IDLE_MS)
-    if snapshot.empty? && !reconcile
-      clear_worker_failure unless dry_run
-      return { "status" => "finished", "reason" => "no_due_events", "queue_size" => @store.queue_size }
-    end
+    # Metadata-only lookup: transcript consumption belongs exclusively to the engine.
+    prepared = @helper.prepare(now_ms: now_ms, dry_run: true,
+      thread_ids: reconcile ? nil : snapshot.keys, force_thread_ids: snapshot.keys,
+      refresh_scope: true, include_context: false)
+    raise "candidate lookup unavailable: #{prepared['reason']}" unless prepared["status"] == "ready"
+    candidates = prepared.fetch("candidates").reject { |entry| entry["id"] == @owner_thread_id }
+    return { "status" => "dry_run", "candidates" => candidates, "queue" => snapshot } if dry_run
 
-    selected_ids = reconcile ? nil : snapshot.keys
-    # Every explicit event is authoritative even when session_index.jsonl keeps
-    # the timestamp from the initial native title. Queue debounce owns event
-    # deduplication; the persisted index timestamp must not discard later Stops.
-    forced_ids = snapshot.keys
-    prepared = @helper.prepare(
-      now_ms: now_ms,
-      dry_run: dry_run,
-      thread_ids: selected_ids,
-      force_thread_ids: forced_ids,
-      refresh_scope: reconcile
-    )
-    return prepared.merge("queue_size" => @store.queue_size) unless prepared["status"] == "ready"
-
-    if dry_run
-      return prepared.merge("queue_snapshot" => snapshot, "reconcile" => reconcile)
-    end
-
-    run_id = prepared.fetch("run_id")
-    window_start_ms = prepared.fetch("window_start_ms")
-    candidates = prepared.fetch("candidates")
-    candidates.reject! { |candidate| @owner_thread_id && candidate["id"] == @owner_thread_id }
-
-    if candidates.empty?
-      @helper.finish(run_id: run_id, now_ms: now_ms, window_start_ms: window_start_ms)
-      @store.acknowledge(snapshot)
-      mark_reconcile_success(date) if reconcile
-      clear_worker_failure
-      return { "status" => "finished", "reason" => "no_candidates", "queue_size" => @store.queue_size }
-    end
-
-    processing_snapshot = ensure_retryable_snapshot(snapshot, candidates, now_ms)
-    live_candidates = attach_live_versions(candidates, now_ms)
-    enriched = enrich_candidates(live_candidates, processing_snapshot)
-    decisions = decisions_for(enriched, processing_snapshot, now_ms)
-    outcomes = apply_decisions(run_id, enriched, decisions, now_ms)
-    @helper.finish(run_id: run_id, now_ms: now_ms, window_start_ms: window_start_ms)
-    applied_ids = outcomes.reject { |outcome| outcome["action"] == "deferred" }.map { |outcome| outcome["id"] }
-    persist_pr_tracking(enriched.select { |candidate| applied_ids.include?(candidate["id"]) }, now_ms)
-    @store.acknowledge(processing_snapshot)
-    mark_reconcile_success(date) if reconcile
-    clear_worker_failure
-    {
-      "status" => "finished",
-      "processed" => outcomes.count { |outcome| %w[rename keep].include?(outcome["action"]) },
-      "renamed" => outcomes.count { |outcome| outcome["action"] == "rename" },
-      "kept" => outcomes.count { |outcome| outcome["action"] == "keep" },
-      "deferred" => candidates.length - live_candidates.length + outcomes.count { |outcome| outcome["action"] == "deferred" },
-      "queue_size" => @store.queue_size
-    }
-  rescue StandardError => error
-    if defined?(run_id) && run_id
-      begin
-        @helper.fail(run_id: run_id)
-      rescue StandardError => cleanup_error
-        warn "failed to clear title-maintenance lock: #{cleanup_error.message}"
-      end
-    end
-    retry_snapshot = defined?(processing_snapshot) && processing_snapshot ? processing_snapshot : snapshot || {}
-    queue_attempts = @store.mark_retry(retry_snapshot, error: error.message, now_ms: now_ms, delay_ms: RETRY_MS)
-    worker_attempts = record_worker_failure(error, now_ms)
-    attempts = [queue_attempts, worker_attempts].max
-    notify_failure(error) if attempts >= 2
-    {
-      "status" => "error",
-      "retry_in_seconds" => RETRY_MS / 1000,
-      "attempts" => attempts,
-      "notified" => attempts >= 2,
-      "error" => error.message
-    }
-  end
-
-  def daemon_loop
-    last_result = { "status" => "finished", "reason" => "daemon_started" }
-    startup_warmup_pending = startup_warmup_due?(@now.call)
-    loop do
-      current_time = @now.call
-      last_result = run_locked(current_time, force_reconcile: startup_warmup_pending, dry_run: false)
-      if startup_warmup_pending && last_result["status"] == "finished" && last_result["reason"] != "retry_pending"
-        mark_startup_warmup_success(current_time)
-        startup_warmup_pending = false
-      end
-      sleep_seconds = next_wake_seconds(@now.call)
-      wait_for_wake(sleep_seconds)
-    end
-    last_result
-  end
-
-  def wait_for_wake(seconds)
-    return sleep(seconds) unless @wake_reader
-    return unless IO.select([@wake_reader], nil, nil, seconds)
-
-    loop do
-      chunk = @wake_reader.read_nonblock(4_096, exception: false)
-      break if chunk == :wait_readable || chunk.nil?
-    end
-  end
-
-  def next_wake_seconds(current_time)
-    now_ms = (current_time.to_r * 1000).to_i
-    state = @store.read_state
-    retry_at_ms = integer(state["worker_retry_at_ms"])
-    return [(retry_at_ms - now_ms) / 1000.0, 1].max if retry_at_ms > now_ms
-
-    waits = []
-    queue_wait = @store.seconds_until_next(now_ms: now_ms, idle_ms: IDLE_MS)
-    waits << queue_wait if queue_wait
-    waits << [((integer(state["last_pr_poll_ms"]) + PR_POLL_MS - now_ms) / 1000.0), 1].max
-    [waits.min || 60, 1].max
-  end
-
-  def ensure_retryable_snapshot(snapshot, candidates, now_ms)
-    combined = snapshot.dup
-    candidates.each do |candidate|
-      next if combined.key?(candidate["id"])
-
-      @store.enqueue(candidate["id"], source: "reconcile", now_ms: now_ms, force: true)
-    end
-    current = @store.snapshot(now_ms: now_ms, idle_ms: 0)
-    candidates.each_with_object(combined) do |candidate, result|
-      entry = current[candidate["id"]] || combined[candidate["id"]]
-      result[candidate["id"]] = entry if entry
-    end
-  end
-
-  def enrich_candidates(candidates, snapshot)
-    tracked = @store.read_state.fetch("prs", {})
-    candidates.map do |candidate|
-      refs = @resolver.refs_for(candidate)
-      if refs.empty?
-        refs = Array(tracked[candidate["id"]]).map do |entry|
-          { "repo" => entry["repo"], "number" => entry["number"] }
-        end
-      end
-      metadata = refs.map { |ref| @resolver.fetch(ref) }
-      candidate.merge(
-        "pull_requests" => metadata,
-        "event_sources" => Array(snapshot.dig(candidate["id"], "sources")),
-        "event_revision" => snapshot.dig(candidate["id"], "revision")
-      )
-    end
-  end
-
-  def attach_live_versions(candidates, now_ms)
-    return [] if candidates.empty?
-
-    client = @app_client_factory.call
-    client.connect
-    candidates.each_with_object([]) do |candidate, result|
-      live = client.read_thread(candidate["id"])
-      live_title = live["name"].to_s.strip
-      if live_title.empty?
-        @store.defer_until_idle(candidate["id"], source: "native-title-pending", now_ms: now_ms)
-        next
-      end
-
-      result << candidate.merge(
-        "title" => live_title,
-        "live_version" => live_thread_version(live)
-      )
-    end
-  ensure
-    client.close if client
-  end
-
-  def decisions_for(candidates, snapshot, now_ms)
-    deterministic = []
-    semantic = []
-    candidates.each do |candidate|
-      decision = deterministic_pr_decision(candidate, snapshot[candidate["id"]])
-      decision ? deterministic << decision : semantic << candidate
-    end
-
-    semantic_decisions = semantic.each_slice(MODEL_BATCH_SIZE).flat_map do |batch|
-      resilient_semantic_decisions(batch, now_ms)
-    end
-    by_id = (deterministic + semantic_decisions).each_with_object({}) { |decision, result| result[decision["id"]] = decision }
-    decisions = candidates.map { |candidate| by_id.fetch(candidate["id"]) }
-    normalize_completion_decisions(candidates, normalize_provisional_decisions(candidates, decisions))
-  end
-
-  def normalize_completion_decisions(candidates, decisions)
-    by_id = candidates.each_with_object({}) { |candidate, index| index[candidate["id"]] = candidate }
-    decisions.map do |decision|
-      next decision unless %w[keep rename].include?(decision["action"])
-      candidate = by_id.fetch(decision["id"])
-      title = decision["action"] == "keep" ? candidate["title"] : decision["title"]
-      next decision unless title.to_s.start_with?("✅")
-
-      open_prs = Array(candidate["pull_requests"]).select { |pr| pr["state"].to_s.upcase == "OPEN" }
-      status = aggregate_pr_status(open_prs) unless open_prs.empty?
-      status ||= "🟡" unless open_prs.empty?
-      messages = Array(candidate.dig("context", "recent_messages") || candidate.dig("context", "messages"))
-      latest = messages.reverse.find { |message| message["role"] == "assistant" }
-      pending = latest && latest["text"].to_s.match?(/未(?:做|完成|进行)?(?:线上|真实|产品)?验收|未部署|待验收|等待.{0,12}验收|验收(?:尚未|未完成|未通过)|not (?:yet )?(?:deployed|validated)|acceptance (?:pending|incomplete)/i)
-      status ||= "⏸️" if pending
-      next decision unless status
-
-      decision.merge("action" => "rename", "title" => status + title[1..-1],
-                     "reason" => "Open PR or explicit pending delivery prevents task completion")
-    end
-  end
-
-  def normalize_provisional_decisions(candidates, decisions)
-    candidates_by_id = candidates.each_with_object({}) { |candidate, result| result[candidate["id"]] = candidate }
-    decisions.map do |decision|
-      candidate = candidates_by_id.fetch(decision["id"])
-      sources = Array(candidate["event_sources"])
-      provisional = sources.include?("user-prompt") && (sources & %w[stop pr-status pr-content]).empty?
-      next decision unless provisional && Array(candidate["pull_requests"]).empty? && decision["action"] == "rename"
-
-      current_status = TitleModelDecider::STATUS_EMOJIS.find { |emoji| decision["title"].to_s.start_with?(emoji) }
-      next decision unless current_status && current_status != "🔄"
-
-      decision.merge("title" => "🔄#{decision['title'][current_status.length..-1]}")
-    end
-  end
-
-  def resilient_semantic_decisions(batch, now_ms)
-    @decider.decide(batch)
-  rescue TitleModelDecider::InvalidDecisionError => error
-    if batch.length > 1
-      midpoint = batch.length / 2
-      return resilient_semantic_decisions(batch.first(midpoint), now_ms) +
-        resilient_semantic_decisions(batch.drop(midpoint), now_ms)
-    end
-
-    candidate = batch.first
-    warn "Terra decision deferred #{candidate['id']}: #{error.message}"
-    @store.defer_until_idle(candidate["id"], source: "invalid-model-decision", now_ms: now_ms)
-    [{ "id" => candidate["id"], "action" => "deferred", "title" => nil, "reason" => error.message }]
-  end
-
-  def deterministic_pr_decision(candidate, event_entry)
-    sources = Array(event_entry && event_entry["sources"])
-    return nil if sources.empty? || sources.any? { |source| source != "pr-status" }
-    status = aggregate_pr_status(candidate["pull_requests"])
-    return nil unless status
-    # A merged PR alone cannot establish deployment or product acceptance.
-    return nil if status == "✅"
-    return nil unless @decider.valid_title?(candidate["title"])
-
-    current_status = TitleModelDecider::STATUS_EMOJIS.find { |emoji| candidate["title"].start_with?(emoji) }
-    new_title = status + candidate["title"][current_status.length..-1]
-    if new_title == candidate["title"]
-      { "id" => candidate["id"], "action" => "keep", "title" => nil, "reason" => "PR metadata changed without changing the title status class" }
-    else
-      { "id" => candidate["id"], "action" => "rename", "title" => new_title, "reason" => "PR status changed" }
-    end
-  end
-
-  def apply_decisions(run_id, candidates, decisions, now_ms)
-    return [] if decisions.empty?
-
-    candidate_by_id = candidates.each_with_object({}) { |candidate, result| result[candidate["id"]] = candidate }
-    client = @app_client_factory.call
-    client.connect
-
-    decisions.map do |decision|
-      candidate = candidate_by_id.fetch(decision["id"])
-      next decision if decision["action"] == "deferred"
-
-      live = client.read_thread(candidate["id"])
-      unless compatible_live_version?(candidate, live)
-        @store.defer_until_idle(candidate["id"], source: "changed-during-decision", now_ms: now_ms)
-        next decision.merge("action" => "deferred", "title" => nil, "reason" => "task changed while title decision was in flight")
-      end
-
-      if decision["action"] == "keep" || decision["title"] == candidate["title"]
-        @helper.record(
-          run_id: run_id,
-          thread_id: candidate["id"],
-          updated_at_ms: candidate["updated_at_ms"],
-          disposition: "kept"
-        )
-        next decision.merge("action" => "keep", "title" => nil)
-      end
-
-      client.set_thread_name(candidate["id"], decision.fetch("title"))
-      visible = @helper.lookup(
-        candidate["id"],
-        expect_title: decision["title"],
-        after_ms: candidate["updated_at_ms"],
-        timeout_ms: 5_000
-      )
-      @helper.record(
-        run_id: run_id,
-        thread_id: candidate["id"],
-        updated_at_ms: visible.fetch("updated_at_ms"),
-        disposition: "renamed"
-      )
-      decision.merge("action" => "rename")
-    end
-  ensure
-    client.close if client
-  end
-
-  def live_thread_version(thread)
-    {
-      "name" => thread["name"].to_s,
-      "updatedAt" => thread["updatedAt"],
-      "status" => thread["status"]
-    }
-  end
-
-  def compatible_live_version?(candidate, live)
-    if candidate["event_revision"] && @store.event_revision(candidate["id"]) != candidate["event_revision"]
-      return false
-    end
-    # A separate app-server does not load the Desktop's active threads.
-    # Lifecycle events establish the provisional phase; notLoaded is not idle.
-    sources = Array(candidate["event_sources"])
-    original = candidate.fetch("live_version")
-    if !sources.include?("stop") && (sources & %w[user-prompt session-start]).any? &&
-        thread_status_type(original["status"]) == "notLoaded" &&
-        thread_status_type(live["status"]) == "notLoaded"
-      return live["name"].to_s == original["name"].to_s
-    end
-    return live_thread_version(live) == candidate["live_version"] unless provisional_candidate?(candidate)
-
-    original = candidate.fetch("live_version")
-    live["name"].to_s == original["name"].to_s &&
-      thread_status_type(live["status"]) == "active" &&
-      thread_status_type(original["status"]) == "active"
-  end
-
-  def provisional_candidate?(candidate)
-    sources = Array(candidate["event_sources"])
-    sources.include?("user-prompt") && (sources & %w[stop pr-status pr-content]).empty? && Array(candidate["pull_requests"]).empty?
-  end
-
-  def thread_status_type(status)
-    status.is_a?(Hash) ? status["type"].to_s : status.to_s
-  end
-
-  def startup_warmup_due?(current_time)
-    now_ms = (current_time.to_r * 1000).to_i
-    last_ms = integer(@store.read_state["last_startup_warmup_ms"])
-    now_ms - last_ms >= STARTUP_WARMUP_COOLDOWN_MS
-  end
-
-  def mark_startup_warmup_success(current_time)
-    now_ms = (current_time.to_r * 1000).to_i
-    @store.update_state { |state| state["last_startup_warmup_ms"] = now_ms }
-  end
-
-  def bootstrap_pr_registry(now_ms)
-    scan = @helper.prepare(now_ms: now_ms, dry_run: true, refresh_scope: true)
-    unless scan["status"] == "ready"
-      raise "PR bootstrap scan unavailable: #{scan["status"]} #{scan["reason"]}".strip
-    end
-    tracked = {}
-    scan.fetch("candidates", []).each do |candidate|
-      refs = @resolver.refs_for(candidate)
-      next if refs.empty?
-
-      metadata = refs.map { |ref| @resolver.fetch(ref) }
-      active = metadata.reject { |pr| terminal_pr?(pr) }
-      tracked[candidate["id"]] = tracking_entries(active, now_ms) unless active.empty?
-      current_status = TitleModelDecider::STATUS_EMOJIS.find { |emoji| candidate["title"].start_with?(emoji) }
-      status = aggregate_pr_status(metadata)
-      if status && current_status && current_status != status
-        @store.enqueue(candidate["id"], source: "pr-status", now_ms: now_ms, force: true)
-      end
-    rescue StandardError => error
-      warn "PR bootstrap skipped #{candidate["id"]}: #{error.message}"
-    end
-    @store.update_state do |state|
-      state["prs"] = state.fetch("prs", {}).merge(tracked)
-      state["bootstrap_completed"] = true
-      state["bootstrap_version"] = PR_BOOTSTRAP_VERSION
-      state["last_pr_poll_ms"] = now_ms
-    end
-  end
-
-  def poll_tracked_prs(now_ms)
-    state = @store.read_state
-    return if now_ms - integer(state["last_pr_poll_ms"]) < PR_POLL_MS
-
-    updates = {}
-    state.fetch("prs", {}).each do |thread_id, entries|
-      next if @owner_thread_id && thread_id == @owner_thread_id
-
-      refreshed = Array(entries).map do |old|
-        metadata = @resolver.fetch("repo" => old.fetch("repo"), "number" => old.fetch("number"))
-        if old["fingerprint"] && old["fingerprint"] != metadata["fingerprint"]
-          source = old["title"] != metadata["title"] ? "pr-content" : "pr-status"
-          @store.enqueue(thread_id, source: source, now_ms: now_ms, force: true)
-        end
-        tracking_entry(metadata, now_ms)
-      end
-      updates[thread_id] = refreshed
-    rescue StandardError => error
-      warn "PR poll skipped #{thread_id}: #{error.message}"
-    end
-    @store.update_state do |current|
-      current["prs"] = current.fetch("prs", {}).merge(updates)
-      current["last_pr_poll_ms"] = now_ms
-    end
-  end
-
-  def persist_pr_tracking(candidates, now_ms)
-    @store.update_state do |state|
-      state["prs"] ||= {}
+    if reconcile
       candidates.each do |candidate|
-        metadata = candidate.fetch("pull_requests", [])
-        active = metadata.reject { |pr| terminal_pr?(pr) }
-        if metadata.empty?
-          state["prs"].delete(candidate["id"]) unless candidate["title"].match?(/(?:\bPR\b|pull request|合并请求)/i)
-        elsif active.empty?
-          state["prs"].delete(candidate["id"])
-        else
-          state["prs"][candidate["id"]] = tracking_entries(active, now_ms)
-        end
+        id = candidate["id"]
+        @store.enqueue(id, source: "reconcile", now_ms: now_ms, force: true) unless @store.event_revision(id)
+      end
+      @store.update_state { |current| current["last_reconcile_date"] = date }
+    end
+    if now_ms - state.fetch("last_pr_poll_ms", 0).to_i >= PR_POLL_MS
+      @engine.poll_due_ids.each do |id|
+        next if id == @owner_thread_id || @store.event_revision(id)
+        @store.enqueue(id, source: "pr-status", now_ms: now_ms, force: true)
+      end
+      @store.update_state do |current|
+        current["last_pr_poll_ms"] = now_ms
+        current["poll_errors"] = @engine.poll_errors
       end
     end
-  end
-
-  def tracking_entries(metadata, now_ms)
-    metadata.map { |pr| tracking_entry(pr, now_ms) }
-  end
-
-  def tracking_entry(pr, now_ms)
-    {
-      "repo" => pr["repo"],
-      "number" => pr["number"],
-      "url" => pr["url"],
-      "title" => pr["title"],
-      "state" => pr["state"],
-      "isDraft" => pr["isDraft"],
-      "statusEmoji" => pr["statusEmoji"],
-      "fingerprint" => pr["fingerprint"],
-      "last_checked_ms" => now_ms
-    }
-  end
-
-  def mark_reconcile_success(date)
-    @store.update_state { |state| state["last_reconcile_date"] = date }
-  end
-
-  def terminal_pr?(pr)
-    pr["mergedAt"] || %w[MERGED CLOSED].include?(pr["state"].to_s.upcase)
-  end
-
-  def aggregate_pr_status(metadata)
-    statuses = Array(metadata).map { |pr| pr["statusEmoji"] }.compact.uniq
-    return nil if statuses.empty?
-    return statuses.first if statuses.length == 1
-
-    ["⚠️", "🔄", "🟡", "⛔", "✅"].find { |status| statuses.include?(status) }
-  end
-
-  def record_worker_failure(error, now_ms)
-    attempts = 0
-    @store.update_state do |state|
-      attempts = integer(state["worker_retry_attempts"]) + 1
-      state["worker_retry_attempts"] = attempts
-      state["worker_retry_at_ms"] = now_ms + RETRY_MS
-      state["worker_last_error"] = error.message.to_s[0, 500]
+    snapshot = @store.snapshot(now_ms: now_ms, idle_ms: IDLE_MS)
+    return { "status" => "finished", "reason" => "no_due_events" } if snapshot.empty?
+    by_id = candidates.each_with_object({}) { |entry, index| index[entry["id"]] = entry }
+    missing = snapshot.keys - by_id.keys
+    unless missing.empty?
+      extra = @helper.prepare(now_ms: now_ms, dry_run: true, thread_ids: missing,
+        force_thread_ids: missing, refresh_scope: true, include_context: false)
+      extra.fetch("candidates", []).each { |entry| by_id[entry["id"]] = entry }
     end
-    attempts
+    outcomes = snapshot.sort_by { |_, entry| [entry.fetch("next_retry_at_ms", 0), entry["revision"]] }.first(PASS_LIMIT).map do |id, event|
+      if id == @owner_thread_id
+        @store.acknowledge(id => event)
+        next { "id" => id, "action" => "excluded" }
+      end
+      process(id, event, by_id[id])
+    end
+    { "status" => "finished", "outcomes" => outcomes, "queue_size" => @store.queue_size }
+  rescue StandardError => error
+    { "status" => "error", "error" => "#{error.class}: #{error.message}" }
   end
 
-  def clear_worker_failure
-    @store.update_state do |state|
-      state.delete("worker_retry_attempts")
-      state.delete("worker_retry_at_ms")
-      state.delete("worker_last_error")
+  def process(id, event, candidate)
+    raise "task missing from session index; event retained" unless candidate
+    client = @app_client_factory.call
+    client.connect
+    original = client.read_thread(id)
+    raise "native title pending" if original["name"].to_s.strip.empty?
+    document = @engine.advance(id, candidate["rollout_path"])
+    if document["excluded"]
+      @store.acknowledge(id => event)
+      return { "id" => id, "action" => "excluded" }
     end
+    unless document["caught_up"]
+      return defer(id, event, "reconstructing", delay_ms: 1_000)
+    end
+    phase = @store.lifecycle(id)
+    last_message = document.dig("cursor", "last_message") || {}
+    active = if phase && %w[user-prompt stop].include?(phase["source"])
+               phase["source"] == "user-prompt"
+             else
+               last_message["role"] == "user" || (last_message["role"] == "assistant" && !%w[final final_answer].include?(last_message["phase"]))
+             end
+    active ||= status_type(original["status"]) == "active"
+    result = @engine.presentation(id, active_turn: active, refresh_prs: Array(event["sources"]).include?("pr-status"))
+    raise result["reason"] unless result["title"]
+    live = client.read_thread(id)
+    fresh = @engine.fresh?(id, user_only: active && result["status"] != "✅")
+    unless @store.event_revision(id) == event["revision"] && live["name"] == original["name"] && fresh
+      return defer(id, event, "changed_before_write")
+    end
+    # Recheck loaded activity immediately before publishing a terminal title.
+    if result["status"] == "✅" && status_type(live["status"]) == "active"
+      return defer(id, event, "turn_started_before_write")
+    end
+    title = result.fetch("title")
+    action = title == live["name"] ? "keep" : "rename"
+    if action == "rename"
+      client.set_thread_name(id, title)
+    end
+    verified = client.read_thread(id)
+    raise "app-server title readback mismatch" unless verified["name"] == title
+    @helper.lookup(id, expect_title: title, timeout_ms: 5_000)
+    @engine.applied(id, title, disposition: action)
+    unless @store.event_revision(id) == event["revision"] && @engine.fresh?(id)
+      return defer(id, event, "changed_after_write")
+    end
+    @store.acknowledge(id => event)
+    { "id" => id, "action" => action, "title" => title, "reason" => result["reason"] }
+  rescue StandardError => error
+    begin
+      @engine.error(id, error)
+    rescue StandardError
+      # Preserve a corrupt checkpoint for diagnosis rather than replacing it.
+    end
+    attempts = @store.mark_retry({ id => event }, error: error.message, now_ms: millis, delay_ms: RETRY_MS)
+    notify_failure(error) if attempts >= 2
+    { "id" => id, "action" => "error", "error" => error.message }
+  ensure
+    client.close if client
+  end
+
+  def defer(id, event, reason, delay_ms: 20_000)
+    # Never replace a newer lifecycle event with a maintenance retry.
+    @store.mark_retry({ id => event }, error: reason, now_ms: millis, delay_ms: delay_ms)
+    { "id" => id, "action" => "deferred", "reason" => reason }
+  end
+
+  def status_type(status)
+    status.is_a?(Hash) ? status["type"] : status.to_s
   end
 
   def notify_failure(error)
-    message = error.message.gsub(/[\r\n]+/, " ")[0, 180]
+    message = error.message.to_s.gsub(/[\r\n]+/, " ")[0, 180]
     fingerprint = Digest::SHA256.hexdigest(message)
-    should_notify = false
+    notify = false
     @store.update_state do |state|
       previous = state["last_error_notification"] || {}
-      if previous["fingerprint"] != fingerprint || TitleEventMaintenance.now_ms - integer(previous["at_ms"]) > 6 * 60 * 60 * 1000
-        should_notify = true
-        state["last_error_notification"] = { "fingerprint" => fingerprint, "at_ms" => TitleEventMaintenance.now_ms }
+      if previous["fingerprint"] != fingerprint || millis - previous.fetch("at_ms", 0) > 21_600_000
+        state["last_error_notification"] = { "fingerprint" => fingerprint, "at_ms" => millis }
+        notify = true
       end
     end
-    return unless should_notify
-
-    escaped = message.gsub("\\", "\\\\").gsub('"', '\\"')
-    script = "display notification \"#{escaped}\" with title \"Codex 标题维护失败\""
-    Open3.capture3("/usr/bin/osascript", "-e", script)
+    Open3.capture3("/usr/bin/osascript", "-e", "display notification #{JSON.generate(message)} with title \"Codex 标题维护失败\"") if notify
   rescue StandardError => notification_error
-    warn "failed to notify title maintenance error: #{notification_error.message}"
+    warn "notification failed: #{notification_error.class}"
   end
 
-  def integer(value)
-    value.nil? ? 0 : Integer(value)
-  rescue ArgumentError, TypeError
-    0
+  def millis
+    (@now.call.to_r * 1000).to_i
+  end
+
+  def next_wake_seconds
+    queue_wait = @store.seconds_until_next(now_ms: millis, idle_ms: IDLE_MS)
+    poll_wait = [(@store.read_state.fetch("last_pr_poll_ms", 0).to_i + PR_POLL_MS - millis) / 1000.0, 1].max
+    [queue_wait || 60, poll_wait, 60].min.clamp(1, 60)
+  end
+
+  def wait_for_wake(seconds)
+    return unless IO.select([@wake_reader], nil, nil, seconds)
+    loop do
+      chunk = @wake_reader.read_nonblock(4096, exception: false)
+      break if chunk == :wait_readable || chunk.nil?
+    end
   end
 end
 
 if $PROGRAM_NAME == __FILE__
-  options = { allow_outside_hours: false, force_reconcile: false, dry_run: false, daemon: false }
+  options = { force_reconcile: false, dry_run: false, daemon: false }
   OptionParser.new do |opts|
     opts.on("--allow-outside-hours") { options[:allow_outside_hours] = true }
     opts.on("--force-reconcile") { options[:force_reconcile] = true }
     opts.on("--dry-run") { options[:dry_run] = true }
     opts.on("--daemon") { options[:daemon] = true }
   end.parse!(ARGV)
-
   ENV[TitleEventMaintenance::WORKER_ENV] = "1"
   daemon = options.delete(:daemon)
   result = daemon ? TitleEventWorker.new.run_daemon : TitleEventWorker.new.run(**options)
-  puts JSON.generate(result) unless result["status"] == "finished" && result["reason"] == "no_due_events"
-  exit(result["status"] == "error" && result["notified"] ? 1 : 0)
+  puts JSON.generate(result)
+  exit(result["status"] == "error" ? 1 : 0)
 end

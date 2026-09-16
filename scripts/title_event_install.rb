@@ -94,11 +94,36 @@ class TitleEventInstaller
     }
     errors_path = File.join(@runtime_root, "worker-errors.log")
     hook_errors_path = File.join(@runtime_root, "hook-errors.log")
+    task_store = TitleTaskStore.new(root: File.join(@runtime_root, "tasks-v1"))
+    task_errors = []
+    tasks = task_store.thread_ids.map do |id|
+      task_store.load(id)
+    rescue StandardError => error
+      task_errors << { "thread_id" => id, "error" => "#{error.class}: #{error.message}" }
+      nil
+    end.compact
+    tasks.each do |task|
+      task_errors << { "thread_id" => task["thread_id"], "error" => task["last_error"] } if task["last_error"]
+    end
+    processing = { "reconstructing" => tasks.count { |task| !task["caught_up"] },
+                   "caught_up" => tasks.count { |task| task["caught_up"] },
+                   "errors" => task_errors, "queue" => store.health }
     ok = hook_report["ok"] && launch_report["ok"] && binaries.values.all? && legacy["paused_or_absent"]
+    status = if !ok
+               "unhealthy"
+             elsif !task_errors.empty?
+               "degraded"
+             elsif processing["reconstructing"].positive? || processing.dig("queue", "count").positive?
+               "processing"
+             else
+               "healthy"
+             end
 
     {
-      "status" => ok ? "healthy" : "unhealthy",
+      "status" => status,
       "ok" => ok,
+      "infrastructure_ok" => ok,
+      "processing" => processing,
       "hook" => hook_report,
       "launch_agent" => launch_report,
       "schedule" => {

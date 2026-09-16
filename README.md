@@ -1,6 +1,6 @@
 # Codex Session Title Maintenance
 
-Event-driven Codex task-title maintenance for macOS. It uses trusted Codex lifecycle hooks, a durable local queue, an always-on per-user `launchd` worker, live PR metadata, and a bounded Codex model pass to keep task titles accurate and searchable.
+Event-driven Codex task-title maintenance for macOS. It uses trusted Codex lifecycle hooks, a durable local queue, an always-on per-user `launchd` worker, live PR metadata, and incremental evidence-backed task state to keep task titles accurate and searchable.
 
 ## What this is
 
@@ -14,7 +14,8 @@ It is not a Codex plugin or an hourly scheduled task. The primary path is event-
 
 ```text
 SessionStart/UserPromptSubmit/Stop hooks -> durable queue
-  -> provisional/final debounce -> launchd worker -> verified Codex title write
+  -> ordered transcript batches -> cited durable task state
+  -> live PR facts -> deterministic title -> verified Codex title write
 ```
 
 ## Native-title compatibility
@@ -23,7 +24,7 @@ Codex still owns the initial title. This tool is a delayed second pass:
 
 1. Codex creates its native task title.
 2. `SessionStart` and `UserPromptSubmit` hooks capture new or resumed goals without blocking the task.
-3. After 20 seconds, a fast provisional pass can update a long-running non-PR task with a `🔄` title while it is still active.
+3. After 20 seconds, a provisional pass becomes eligible; active tasks display `🔄`. Initial reconstruction and model latency add processing time.
 4. A `Stop` hook schedules a final pass after a 90-second quiet window so complete context and status can correct the title.
 5. The worker reads the live title and task version before deciding, then checks them again immediately before writing. A manual/native title change invalidates the stale decision.
 
@@ -81,7 +82,7 @@ INSTALLER="${CODEX_HOME:-$HOME/.codex}/skills/codex-session-title-maintenance/sc
 - 90-second final title pass after Stop
 - startup reconciliation of recent and pinned tasks, protected by a 30-minute persisted cooldown
 - one recovery reconciliation of recent and pinned tasks per Beijing calendar day
-- ten-minute PR metadata polling only for already-tracked active PRs
+- ten-minute PR metadata polling for current goal associations; merged PRs retain outstanding acceptance
 - status prefix: `🔄` `🟡` `⚠️` `⏸️` `✅` `⛔` `⏱️`
 - transient failures retry after ten minutes; a macOS notification is sent only after the second consecutive failure
 
@@ -90,8 +91,28 @@ Optional environment variables include `CODEX_TITLE_MODEL`, `CODEX_TITLE_REASONI
 ## Tests
 
 ```bash
-ruby tests/title_event_test.rb
-ruby tests/title_maintenance_test.rb
+ruby -Itests -e 'Dir["tests/*_test.rb"].sort.each { |f| require File.expand_path(f) }'
 ```
 
-The tests cover event-specific debounce/retry, lifecycle-hook capture, startup and Beijing-day reconciliation, active-task title updates, app-server transport, PR status mapping, stale-index recovery, and the native/manual-title concurrency guard.
+The tests cover transcript segmentation/partial lines, evidence validation, requirement persistence, PR identity, completion and monitoring, atomic cursor recovery, lifecycle ordering, corrupt-checkpoint isolation, concurrent events, manual title changes and both title readbacks.
+
+## Durable task state
+
+See [ADR 0001](docs/adr/0001-evidence-backed-task-state.md) for the contract and limitations.
+
+The model proposes cited state changes, not titles. Each requirement survives until resolved, explicitly waived by the user, or archived with a user-evidenced goal replacement. The renderer checks every requirement and live current PR facts; merge alone never establishes acceptance. Initial reconstruction must finish before publishing a title. Subsequent passes consume only new messages.
+
+Checkpoints live under `~/.codex/title-maintenance/tasks-v1/`. State and source cursor commit together. Per-task retries do not block other tasks. The queue retains unconsumed input even after a provisional title write. Legacy title timestamps are never reused as transcript cursors.
+
+`doctor` distinguishes infrastructure readiness from semantic processing: queue age, reconstruction count and task errors. It does not equate an alive daemon with correct titles.
+
+### Shadow replay
+
+```bash
+ruby scripts/title_task_replay.rb --thread TASK_UUID --root /absolute/shadow-directory --batches 20
+ruby scripts/title_task_replay.rb --thread TASK_UUID --root /absolute/shadow-directory --inspect
+```
+
+Replay makes model and GitHub read calls and writes only the selected shadow checkpoint directory. It never changes task titles. Resume unfinished replay with the same root; choose a fresh directory for independent validation. Keep private transcripts and task IDs out of commits.
+
+Before upgrading, keep a rollback copy of installed scripts and preserve queue/checkpoint data. Install using `install --canary`; verify representative title readbacks separately. The app-server has no atomic name compare-and-set, so the worker guards and requeues concurrent changes but cannot eliminate the final read/write race. Model extraction remains fallible; citations and replay make it auditable.
